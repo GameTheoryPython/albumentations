@@ -1,76 +1,99 @@
-from __future__ import absolute_import, division
+from __future__ import annotations
 
 import math
+import numbers
 import random
 import warnings
-from enum import Enum
 from types import LambdaType
-from skimage.measure import label
+from typing import Any, Callable, Dict, List, Sequence, Tuple, Union, cast
+from warnings import warn
 
+import albucore
 import cv2
 import numpy as np
+from albucore.functions import add_weighted, from_float, multiply, normalize, normalize_per_image, to_float
+from albucore.utils import (
+    MAX_VALUES_BY_DTYPE,
+    NUM_MULTI_CHANNEL_DIMENSIONS,
+    clip,
+    get_num_channels,
+    is_grayscale_image,
+    is_rgb_image,
+)
+from pydantic import AfterValidator, BaseModel, Field, ValidationInfo, field_validator, model_validator
+from scipy import special
+from scipy.ndimage import gaussian_filter
+from typing_extensions import Annotated, Literal, Self, TypedDict
 
-from . import functional as F
-from .bbox_utils import denormalize_bbox, normalize_bbox, union_of_bboxes
-from ..core.transforms_interface import DualTransform, ImageOnlyTransform, NoOp, to_tuple
-from ..core.utils import format_args
+from albumentations import random_utils
+from albumentations.augmentations.blur.functional import blur
+from albumentations.augmentations.blur.transforms import BlurInitSchema, process_blur_limit
+from albumentations.augmentations.utils import check_range, non_rgb_error
+from albumentations.core.pydantic import (
+    InterpolationType,
+    NonNegativeFloatRangeType,
+    OnePlusFloatRangeType,
+    OnePlusIntRangeType,
+    ProbabilityType,
+    SymmetricRangeType,
+    ZeroOneRangeType,
+    check_0plus,
+    check_01,
+    check_1plus,
+    nondecreasing,
+)
+from albumentations.core.transforms_interface import (
+    BaseTransformInitSchema,
+    DualTransform,
+    ImageOnlyTransform,
+    Interpolation,
+    NoOp,
+)
+from albumentations.core.types import (
+    MAX_RAIN_ANGLE,
+    MONO_CHANNEL_DIMENSIONS,
+    NUM_RGB_CHANNELS,
+    PAIR,
+    ChromaticAberrationMode,
+    ColorType,
+    ImageMode,
+    MorphologyMode,
+    PlanckianJitterMode,
+    RainMode,
+    ScaleFloatType,
+    ScaleIntType,
+    SpatterMode,
+    Targets,
+)
+from albumentations.core.utils import format_args, to_tuple
+
+from . import functional as fmain
 
 __all__ = [
-    "Blur",
-    "VerticalFlip",
-    "HorizontalFlip",
-    "Flip",
     "Normalize",
-    "Transpose",
-    "RandomCrop",
     "RandomGamma",
-    "RandomRotate90",
-    "Rotate",
-    "ShiftScaleRotate",
-    "CenterCrop",
-    "OpticalDistortion",
-    "GridDistortion",
-    "ElasticTransform",
     "RandomGridShuffle",
     "HueSaturationValue",
-    "PadIfNeeded",
     "RGBShift",
-    "RandomBrightness",
-    "RandomContrast",
-    "MotionBlur",
-    "MedianBlur",
-    "GaussianBlur",
     "GaussNoise",
-    "GlassBlur",
     "CLAHE",
     "ChannelShuffle",
     "InvertImg",
     "ToGray",
+    "ToRGB",
     "ToSepia",
-    "JpegCompression",
     "ImageCompression",
-    "Cutout",
-    "CoarseDropout",
     "ToFloat",
     "FromFloat",
-    "Crop",
-    "CropNonEmptyMaskIfExists",
-    "RandomScale",
-    "LongestMaxSize",
-    "SmallestMaxSize",
-    "Resize",
-    "RandomSizedCrop",
-    "RandomResizedCrop",
     "RandomBrightnessContrast",
-    "RandomCropNearBBox",
-    "RandomSizedBBoxSafeCrop",
     "RandomSnow",
+    "RandomGravel",
     "RandomRain",
     "RandomFog",
     "RandomSunFlare",
     "RandomShadow",
+    "RandomToneCurve",
     "Lambda",
-    "ChannelDropout",
     "ISONoise",
     "Solarize",
     "Equalize",
@@ -78,1678 +101,798 @@ __all__ = [
     "Downscale",
     "MultiplicativeNoise",
     "FancyPCA",
-    "MaskDropout",
-    "GridDropout",
+    "ColorJitter",
+    "Sharpen",
+    "Emboss",
+    "Superpixels",
+    "TemplateTransform",
+    "RingingOvershoot",
+    "UnsharpMask",
+    "PixelDropout",
+    "Spatter",
+    "ChromaticAberration",
+    "Morphological",
+    "PlanckianJitter",
 ]
 
+NUM_BITS_ARRAY_LENGTH = 3
+MAX_JPEG_QUALITY = 100
+TWENTY = 20
 
-class PadIfNeeded(DualTransform):
-    """Pad side of the image / max if side is less than desired number.
+
+class RandomGridShuffle(DualTransform):
+    """Randomly shuffles the grid's cells on an image, mask, or keypoints,
+    effectively rearranging patches within the image.
+    This transformation divides the image into a grid and then permutes these grid cells based on a random mapping.
+
 
     Args:
-        min_height (int): minimal result image height.
-        min_width (int): minimal result image width.
-        border_mode (OpenCV flag): OpenCV border mode.
-        value (int, float, list of int, lisft of float): padding value if border_mode is cv2.BORDER_CONSTANT.
-        mask_value (int, float,
-                    list of int,
-                    lisft of float): padding value for mask if border_mode is cv2.BORDER_CONSTANT.
-        p (float): probability of applying the transform. Default: 1.0.
-
-    Targets:
-        image, mask, bbox, keypoints
-
-    Image types:
-        uint8, float32
-
-    """
-
-    def __init__(
-        self,
-        min_height=1024,
-        min_width=1024,
-        border_mode=cv2.BORDER_REFLECT_101,
-        value=None,
-        mask_value=None,
-        always_apply=False,
-        p=1.0,
-    ):
-        super(PadIfNeeded, self).__init__(always_apply, p)
-        self.min_height = min_height
-        self.min_width = min_width
-        self.border_mode = border_mode
-        self.value = value
-        self.mask_value = mask_value
-
-    def update_params(self, params, **kwargs):
-        params = super(PadIfNeeded, self).update_params(params, **kwargs)
-        rows = params["rows"]
-        cols = params["cols"]
-
-        if rows < self.min_height:
-            h_pad_top = int((self.min_height - rows) / 2.0)
-            h_pad_bottom = self.min_height - rows - h_pad_top
-        else:
-            h_pad_top = 0
-            h_pad_bottom = 0
-
-        if cols < self.min_width:
-            w_pad_left = int((self.min_width - cols) / 2.0)
-            w_pad_right = self.min_width - cols - w_pad_left
-        else:
-            w_pad_left = 0
-            w_pad_right = 0
-
-        params.update(
-            {"pad_top": h_pad_top, "pad_bottom": h_pad_bottom, "pad_left": w_pad_left, "pad_right": w_pad_right}
-        )
-        return params
-
-    def apply(self, img, pad_top=0, pad_bottom=0, pad_left=0, pad_right=0, **params):
-        return F.pad_with_params(
-            img, pad_top, pad_bottom, pad_left, pad_right, border_mode=self.border_mode, value=self.value
-        )
-
-    def apply_to_mask(self, img, pad_top=0, pad_bottom=0, pad_left=0, pad_right=0, **params):
-        return F.pad_with_params(
-            img, pad_top, pad_bottom, pad_left, pad_right, border_mode=self.border_mode, value=self.mask_value
-        )
-
-    def apply_to_bbox(self, bbox, pad_top=0, pad_bottom=0, pad_left=0, pad_right=0, rows=0, cols=0, **params):
-        x_min, y_min, x_max, y_max = denormalize_bbox(bbox, rows, cols)
-        bbox = x_min + pad_left, y_min + pad_top, x_max + pad_left, y_max + pad_top
-        return normalize_bbox(bbox, rows + pad_top + pad_bottom, cols + pad_left + pad_right)
-
-    def apply_to_keypoint(self, keypoint, pad_top=0, pad_bottom=0, pad_left=0, pad_right=0, **params):
-        x, y, angle, scale = keypoint
-        return x + pad_left, y + pad_top, angle, scale
-
-    def get_transform_init_args_names(self):
-        return ("min_height", "min_width", "border_mode", "value", "mask_value")
-
-
-class Crop(DualTransform):
-    """Crop region from image.
-
-    Args:
-        x_min (int): Minimum upper left x coordinate.
-        y_min (int): Minimum upper left y coordinate.
-        x_max (int): Maximum lower right x coordinate.
-        y_max (int): Maximum lower right y coordinate.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, x_min=0, y_min=0, x_max=1024, y_max=1024, always_apply=False, p=1.0):
-        super(Crop, self).__init__(always_apply, p)
-        self.x_min = x_min
-        self.y_min = y_min
-        self.x_max = x_max
-        self.y_max = y_max
-
-    def apply(self, img, **params):
-        return F.crop(img, x_min=self.x_min, y_min=self.y_min, x_max=self.x_max, y_max=self.y_max)
-
-    def apply_to_bbox(self, bbox, **params):
-        return F.bbox_crop(bbox, x_min=self.x_min, y_min=self.y_min, x_max=self.x_max, y_max=self.y_max, **params)
-
-    def apply_to_keypoint(self, keypoint, **params):
-        return F.crop_keypoint_by_coords(
-            keypoint,
-            crop_coords=(self.x_min, self.y_min, self.x_max, self.y_max),
-            crop_height=self.y_max - self.y_min,
-            crop_width=self.x_max - self.x_min,
-            rows=params["rows"],
-            cols=params["cols"],
-        )
-
-    def get_transform_init_args_names(self):
-        return ("x_min", "y_min", "x_max", "y_max")
-
-
-class VerticalFlip(DualTransform):
-    """Flip the input vertically around the x-axis.
-
-    Args:
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def apply(self, img, **params):
-        return F.vflip(img)
-
-    def apply_to_bbox(self, bbox, **params):
-        return F.bbox_vflip(bbox, **params)
-
-    def apply_to_keypoint(self, keypoint, **params):
-        return F.keypoint_vflip(keypoint, **params)
-
-    def get_transform_init_args_names(self):
-        return ()
-
-
-class HorizontalFlip(DualTransform):
-    """Flip the input horizontally around the y-axis.
-
-    Args:
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def apply(self, img, **params):
-        if img.ndim == 3 and img.shape[2] > 1 and img.dtype == np.uint8:
-            # Opencv is faster than numpy only in case of
-            # non-gray scale 8bits images
-            return F.hflip_cv2(img)
-        else:
-            return F.hflip(img)
-
-    def apply_to_bbox(self, bbox, **params):
-        return F.bbox_hflip(bbox, **params)
-
-    def apply_to_keypoint(self, keypoint, **params):
-        return F.keypoint_hflip(keypoint, **params)
-
-    def get_transform_init_args_names(self):
-        return ()
-
-
-class Flip(DualTransform):
-    """Flip the input either horizontally, vertically or both horizontally and vertically.
-
-    Args:
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def apply(self, img, d=0, **params):
-        """Args:
-        d (int): code that specifies how to flip the input. 0 for vertical flipping, 1 for horizontal flipping,
-                -1 for both vertical and horizontal flipping (which is also could be seen as rotating the input by
-                180 degrees).
-        """
-        return F.random_flip(img, d)
-
-    def get_params(self):
-        # Random int in the range [-1, 1]
-        return {"d": random.randint(-1, 1)}
-
-    def apply_to_bbox(self, bbox, **params):
-        return F.bbox_flip(bbox, **params)
-
-    def apply_to_keypoint(self, keypoint, **params):
-        return F.keypoint_flip(keypoint, **params)
-
-    def get_transform_init_args_names(self):
-        return ()
-
-
-class Transpose(DualTransform):
-    """Transpose the input by swapping rows and columns.
-
-    Args:
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def apply(self, img, **params):
-        return F.transpose(img)
-
-    def apply_to_bbox(self, bbox, **params):
-        return F.bbox_transpose(bbox, 0, **params)
-
-    def apply_to_keypoint(self, keypoint, **params):
-        return F.keypoint_transpose(keypoint)
-
-    def get_transform_init_args_names(self):
-        return ()
-
-
-class LongestMaxSize(DualTransform):
-    """Rescale an image so that maximum side is equal to max_size, keeping the aspect ratio of the initial image.
-
-    Args:
-        max_size (int): maximum size of the image after the transformation.
-        interpolation (OpenCV flag): interpolation method. Default: cv2.INTER_LINEAR.
-        p (float): probability of applying the transform. Default: 1.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, max_size=1024, interpolation=cv2.INTER_LINEAR, always_apply=False, p=1):
-        super(LongestMaxSize, self).__init__(always_apply, p)
-        self.interpolation = interpolation
-        self.max_size = max_size
-
-    def apply(self, img, interpolation=cv2.INTER_LINEAR, **params):
-        return F.longest_max_size(img, max_size=self.max_size, interpolation=interpolation)
-
-    def apply_to_bbox(self, bbox, **params):
-        # Bounding box coordinates are scale invariant
-        return bbox
-
-    def apply_to_keypoint(self, keypoint, **params):
-        height = params["rows"]
-        width = params["cols"]
-
-        scale = self.max_size / max([height, width])
-        return F.keypoint_scale(keypoint, scale, scale)
-
-    def get_transform_init_args_names(self):
-        return ("max_size", "interpolation")
-
-
-class SmallestMaxSize(DualTransform):
-    """Rescale an image so that minimum side is equal to max_size, keeping the aspect ratio of the initial image.
-
-    Args:
-        max_size (int): maximum size of smallest side of the image after the transformation.
-        interpolation (OpenCV flag): interpolation method. Default: cv2.INTER_LINEAR.
-        p (float): probability of applying the transform. Default: 1.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, max_size=1024, interpolation=cv2.INTER_LINEAR, always_apply=False, p=1):
-        super(SmallestMaxSize, self).__init__(always_apply, p)
-        self.interpolation = interpolation
-        self.max_size = max_size
-
-    def apply(self, img, interpolation=cv2.INTER_LINEAR, **params):
-        return F.smallest_max_size(img, max_size=self.max_size, interpolation=interpolation)
-
-    def apply_to_bbox(self, bbox, **params):
-        return bbox
-
-    def apply_to_keypoint(self, keypoint, **params):
-        height = params["rows"]
-        width = params["cols"]
-
-        scale = self.max_size / min([height, width])
-        return F.keypoint_scale(keypoint, scale, scale)
-
-    def get_transform_init_args_names(self):
-        return ("max_size", "interpolation")
-
-
-class Resize(DualTransform):
-    """Resize the input to the given height and width.
-
-    Args:
-        height (int): desired height of the output.
-        width (int): desired width of the output.
-        interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
-            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
-            Default: cv2.INTER_LINEAR.
-        p (float): probability of applying the transform. Default: 1.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, height, width, interpolation=cv2.INTER_LINEAR, always_apply=False, p=1):
-        super(Resize, self).__init__(always_apply, p)
-        self.height = height
-        self.width = width
-        self.interpolation = interpolation
-
-    def apply(self, img, interpolation=cv2.INTER_LINEAR, **params):
-        return F.resize(img, height=self.height, width=self.width, interpolation=interpolation)
-
-    def apply_to_bbox(self, bbox, **params):
-        # Bounding box coordinates are scale invariant
-        return bbox
-
-    def apply_to_keypoint(self, keypoint, **params):
-        height = params["rows"]
-        width = params["cols"]
-        scale_x = self.width / width
-        scale_y = self.height / height
-        return F.keypoint_scale(keypoint, scale_x, scale_y)
-
-    def get_transform_init_args_names(self):
-        return ("height", "width", "interpolation")
-
-
-class RandomRotate90(DualTransform):
-    """Randomly rotate the input by 90 degrees zero or more times.
-
-    Args:
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def apply(self, img, factor=0, **params):
-        """
-        Args:
-            factor (int): number of times the input will be rotated by 90 degrees.
-        """
-        return np.ascontiguousarray(np.rot90(img, factor))
-
-    def get_params(self):
-        # Random int in the range [0, 3]
-        return {"factor": random.randint(0, 3)}
-
-    def apply_to_bbox(self, bbox, factor=0, **params):
-        return F.bbox_rot90(bbox, factor, **params)
-
-    def apply_to_keypoint(self, keypoint, factor=0, **params):
-        return F.keypoint_rot90(keypoint, factor, **params)
-
-    def get_transform_init_args_names(self):
-        return ()
-
-
-class Rotate(DualTransform):
-    """Rotate the input by an angle selected randomly from the uniform distribution.
-
-    Args:
-        limit ((int, int) or int): range from which a random angle is picked. If limit is a single int
-            an angle is picked from (-limit, limit). Default: (-90, 90)
-        interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
-            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
-            Default: cv2.INTER_LINEAR.
-        border_mode (OpenCV flag): flag that is used to specify the pixel extrapolation method. Should be one of:
-            cv2.BORDER_CONSTANT, cv2.BORDER_REPLICATE, cv2.BORDER_REFLECT, cv2.BORDER_WRAP, cv2.BORDER_REFLECT_101.
-            Default: cv2.BORDER_REFLECT_101
-        value (int, float, list of ints, list of float): padding value if border_mode is cv2.BORDER_CONSTANT.
-        mask_value (int, float,
-                    list of ints,
-                    list of float): padding value if border_mode is cv2.BORDER_CONSTANT applied for masks.
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(
-        self,
-        limit=90,
-        interpolation=cv2.INTER_LINEAR,
-        border_mode=cv2.BORDER_REFLECT_101,
-        value=None,
-        mask_value=None,
-        always_apply=False,
-        p=0.5,
-    ):
-        super(Rotate, self).__init__(always_apply, p)
-        self.limit = to_tuple(limit)
-        self.interpolation = interpolation
-        self.border_mode = border_mode
-        self.value = value
-        self.mask_value = mask_value
-
-    def apply(self, img, angle=0, interpolation=cv2.INTER_LINEAR, **params):
-        return F.rotate(img, angle, interpolation, self.border_mode, self.value)
-
-    def apply_to_mask(self, img, angle=0, **params):
-        return F.rotate(img, angle, cv2.INTER_NEAREST, self.border_mode, self.mask_value)
-
-    def get_params(self):
-        return {"angle": random.uniform(self.limit[0], self.limit[1])}
-
-    def apply_to_bbox(self, bbox, angle=0, **params):
-        return F.bbox_rotate(bbox, angle, **params)
-
-    def apply_to_keypoint(self, keypoint, angle=0, **params):
-        return F.keypoint_rotate(keypoint, angle, **params)
-
-    def get_transform_init_args_names(self):
-        return ("limit", "interpolation", "border_mode", "value", "mask_value")
-
-
-class RandomScale(DualTransform):
-    """Randomly resize the input. Output image size is different from the input image size.
-
-    Args:
-        scale_limit ((float, float) or float): scaling factor range. If scale_limit is a single float value, the
-            range will be (1 - scale_limit, 1 + scale_limit). Default: (0.9, 1.1).
-        interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
-            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
-            Default: cv2.INTER_LINEAR.
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, scale_limit=0.1, interpolation=cv2.INTER_LINEAR, always_apply=False, p=0.5):
-        super(RandomScale, self).__init__(always_apply, p)
-        self.scale_limit = to_tuple(scale_limit, bias=1.0)
-        self.interpolation = interpolation
-
-    def get_params(self):
-        return {"scale": random.uniform(self.scale_limit[0], self.scale_limit[1])}
-
-    def apply(self, img, scale=0, interpolation=cv2.INTER_LINEAR, **params):
-        return F.scale(img, scale, interpolation)
-
-    def apply_to_bbox(self, bbox, **params):
-        # Bounding box coordinates are scale invariant
-        return bbox
-
-    def apply_to_keypoint(self, keypoint, scale=0, **params):
-        return F.keypoint_scale(keypoint, scale, scale)
-
-    def get_transform_init_args(self):
-        return {"interpolation": self.interpolation, "scale_limit": to_tuple(self.scale_limit, bias=-1.0)}
-
-
-class ShiftScaleRotate(DualTransform):
-    """Randomly apply affine transforms: translate, scale and rotate the input.
-
-    Args:
-        shift_limit ((float, float) or float): shift factor range for both height and width. If shift_limit
-            is a single float value, the range will be (-shift_limit, shift_limit). Absolute values for lower and
-            upper bounds should lie in range [0, 1]. Default: (-0.0625, 0.0625).
-        scale_limit ((float, float) or float): scaling factor range. If scale_limit is a single float value, the
-            range will be (-scale_limit, scale_limit). Default: (-0.1, 0.1).
-        rotate_limit ((int, int) or int): rotation range. If rotate_limit is a single int value, the
-            range will be (-rotate_limit, rotate_limit). Default: (-45, 45).
-        interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
-            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
-            Default: cv2.INTER_LINEAR.
-        border_mode (OpenCV flag): flag that is used to specify the pixel extrapolation method. Should be one of:
-            cv2.BORDER_CONSTANT, cv2.BORDER_REPLICATE, cv2.BORDER_REFLECT, cv2.BORDER_WRAP, cv2.BORDER_REFLECT_101.
-            Default: cv2.BORDER_REFLECT_101
-        value (int, float, list of int, list of float): padding value if border_mode is cv2.BORDER_CONSTANT.
-        mask_value (int, float,
-                    list of int,
-                    list of float): padding value if border_mode is cv2.BORDER_CONSTANT applied for masks.
-        p (float): probability of applying the transform. Default: 0.5.
+        grid (tuple[int, int]): Size of the grid for splitting the image into cells. Each cell is shuffled randomly.
+        p (float): Probability that the transform will be applied.
 
     Targets:
         image, mask, keypoints
 
     Image types:
         uint8, float32
+
+    Examples:
+        >>> import albumentations as A
+        >>> transform = A.Compose([
+            A.RandomGridShuffle(grid=(3, 3), p=1.0)
+        ])
+        >>> transformed = transform(image=my_image, mask=my_mask)
+        >>> image, mask = transformed['image'], transformed['mask']
+        # This will shuffle the 3x3 grid cells of `my_image` and `my_mask` randomly.
+        # Mask and image are shuffled in a consistent way
+    Note:
+        This transform could be useful when only micro features are important for the model, and memorizing
+        the global structure could be harmful. For example:
+        - Identifying the type of cell phone used to take a picture based on micro artifacts generated by
+        phone post-processing algorithms, rather than the semantic features of the photo.
+        See more at https://ieeexplore.ieee.org/abstract/document/8622031
+        - Identifying stress, glucose, hydration levels based on skin images.
     """
 
-    def __init__(
+    class InitSchema(BaseTransformInitSchema):
+        grid: Annotated[tuple[int, int], AfterValidator(check_1plus)] = (3, 3)
+
+    _targets = (Targets.IMAGE, Targets.MASK, Targets.KEYPOINTS)
+
+    def __init__(self, grid: tuple[int, int] = (3, 3), p: float = 0.5, always_apply: bool | None = None):
+        super().__init__(p=p, always_apply=always_apply)
+        self.grid = grid
+
+    def apply(self, img: np.ndarray, tiles: np.ndarray, mapping: list[int], **params: Any) -> np.ndarray:
+        return fmain.swap_tiles_on_image(img, tiles, mapping)
+
+    def apply_to_mask(self, mask: np.ndarray, tiles: np.ndarray, mapping: list[int], **params: Any) -> np.ndarray:
+        return fmain.swap_tiles_on_image(mask, tiles, mapping)
+
+    def apply_to_keypoints(
         self,
-        shift_limit=0.0625,
-        scale_limit=0.1,
-        rotate_limit=45,
-        interpolation=cv2.INTER_LINEAR,
-        border_mode=cv2.BORDER_REFLECT_101,
-        value=None,
-        mask_value=None,
-        always_apply=False,
-        p=0.5,
-    ):
-        super(ShiftScaleRotate, self).__init__(always_apply, p)
-        self.shift_limit = to_tuple(shift_limit)
-        self.scale_limit = to_tuple(scale_limit, bias=1.0)
-        self.rotate_limit = to_tuple(rotate_limit)
-        self.interpolation = interpolation
-        self.border_mode = border_mode
-        self.value = value
-        self.mask_value = mask_value
+        keypoints: np.ndarray,
+        tiles: np.ndarray,
+        mapping: np.ndarray,
+        **params: Any,
+    ) -> np.ndarray:
+        return fmain.swap_tiles_on_keypoints(keypoints, tiles, mapping)
 
-    def apply(self, img, angle=0, scale=0, dx=0, dy=0, interpolation=cv2.INTER_LINEAR, **params):
-        return F.shift_scale_rotate(img, angle, scale, dx, dy, interpolation, self.border_mode, self.value)
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, np.ndarray]:
+        height, width = params["shape"][:2]
+        random_state = random_utils.get_random_state()
+        original_tiles = fmain.split_uniform_grid(
+            (height, width),
+            self.grid,
+            random_state=random_state,
+        )
+        shape_groups = fmain.create_shape_groups(original_tiles)
+        mapping = fmain.shuffle_tiles_within_shape_groups(shape_groups, random_state=random_state)
 
-    def apply_to_mask(self, img, angle=0, scale=0, dx=0, dy=0, **params):
-        return F.shift_scale_rotate(img, angle, scale, dx, dy, cv2.INTER_NEAREST, self.border_mode, self.mask_value)
+        return {"tiles": original_tiles, "mapping": mapping}
 
-    def apply_to_keypoint(
-        self, keypoint, angle=0, scale=0, dx=0, dy=0, rows=0, cols=0, interpolation=cv2.INTER_LINEAR, **params
-    ):
-        return F.keypoint_shift_scale_rotate(keypoint, angle, scale, dx, dy, rows, cols)
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return ("grid",)
 
-    def get_params(self):
+    @property
+    def targets(self) -> dict[str, Callable[..., Any]]:
         return {
-            "angle": random.uniform(self.rotate_limit[0], self.rotate_limit[1]),
-            "scale": random.uniform(self.scale_limit[0], self.scale_limit[1]),
-            "dx": random.uniform(self.shift_limit[0], self.shift_limit[1]),
-            "dy": random.uniform(self.shift_limit[0], self.shift_limit[1]),
-        }
-
-    def apply_to_bbox(self, bbox, angle, scale, dx, dy, interpolation=cv2.INTER_LINEAR, **params):
-        return F.bbox_shift_scale_rotate(bbox, angle, scale, dx, dy, interpolation=cv2.INTER_LINEAR, **params)
-
-    def get_transform_init_args(self):
-        return {
-            "shift_limit": self.shift_limit,
-            "scale_limit": to_tuple(self.scale_limit, bias=-1.0),
-            "rotate_limit": self.rotate_limit,
-            "interpolation": self.interpolation,
-            "border_mode": self.border_mode,
-            "value": self.value,
-            "mask_value": self.mask_value,
+            "image": self.apply,
+            "mask": self.apply_to_mask,
+            "masks": self.apply_to_masks,
+            "keypoints": self.apply_to_keypoints,
         }
 
 
-class CenterCrop(DualTransform):
-    """Crop the central part of the input.
+class Normalize(ImageOnlyTransform):
+    """Applies various normalization techniques to an image. The specific normalization technique can be selected
+        with the `normalization` parameter.
+
+    Standard normalization is applied using the formula:
+        `img = (img - mean * max_pixel_value) / (std * max_pixel_value)`.
+        Other normalization techniques adjust the image based on global or per-channel statistics,
+        or scale pixel values to a specified range.
 
     Args:
-        height (int): height of the crop.
-        width (int): width of the crop.
-        p (float): probability of applying the transform. Default: 1.
+        mean (ColorType | None): Mean values for standard normalization.
+            For "standard" normalization, the default values are ImageNet mean values: (0.485, 0.456, 0.406).
+            For "inception" normalization, use mean values of (0.5, 0.5, 0.5).
+        std (ColorType | None): Standard deviation values for standard normalization.
+            For "standard" normalization, the default values are ImageNet standard deviation :(0.229, 0.224, 0.225).
+            For "inception" normalization, use standard deviation values of (0.5, 0.5, 0.5).
+        max_pixel_value (float | None): Maximum possible pixel value, used for scaling in standard normalization.
+            Defaults to 255.0.
+        normalization (Literal["standard", "image", "image_per_channel", "min_max", "min_max_per_channel", "inception"])
+            Specifies the normalization technique to apply. Defaults to "standard".
+            - "standard": Applies the formula `(img - mean * max_pixel_value) / (std * max_pixel_value)`.
+                The default mean and std are based on ImageNet.
+            - "image": Normalizes the whole image based on its global mean and standard deviation.
+            - "image_per_channel": Normalizes the image per channel based on each channel's mean and standard deviation.
+            - "min_max": Scales the image pixel values to a [0, 1] range based on the global
+                minimum and maximum pixel values.
+            - "min_max_per_channel": Scales each channel of the image pixel values to a [0, 1]
+                range based on the per-channel minimum and maximum pixel values.
+
+        p (float): Probability of applying the transform. Defaults to 1.0.
 
     Targets:
-        image, mask, bboxes, keypoints
+        image
 
     Image types:
         uint8, float32
 
     Note:
-        It is recommended to use uint8 images as input.
-        Otherwise the operation will require internal conversion
-        float32 -> uint8 -> float32 that causes worse performance.
+        - For "standard" normalization, `mean`, `std`, and `max_pixel_value` must be provided.
+        - For other normalization types, these parameters are ignored.
+        - For inception normalization, use mean values of (0.5, 0.5, 0.5).
+        - For YOLO normalization, use mean values of (0.5, 0.5, 0.5) and std values of (0, 0, 0).
+        - This transform is often used as a final step in image preprocessing pipelines to
+          prepare images for neural network input.
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>> # Standard ImageNet normalization
+        >>> transform = A.Normalize(
+        ...     mean=(0.485, 0.456, 0.406),
+        ...     std=(0.229, 0.224, 0.225),
+        ...     max_pixel_value=255.0,
+        ...     p=1.0
+        ... )
+        >>> normalized_image = transform(image=image)["image"]
+        >>>
+        >>> # Min-max normalization
+        >>> transform_minmax = A.Normalize(normalization="min_max", p=1.0)
+        >>> normalized_image_minmax = transform_minmax(image=image)["image"]
+
+    References:
+        - ImageNet mean and std: https://pytorch.org/vision/stable/models.html
+        - Inception preprocessing: https://keras.io/api/applications/inceptionv3/
     """
 
-    def __init__(self, height, width, always_apply=False, p=1.0):
-        super(CenterCrop, self).__init__(always_apply, p)
-        self.height = height
-        self.width = width
+    class InitSchema(BaseTransformInitSchema):
+        mean: ColorType | None
+        std: ColorType | None
+        max_pixel_value: float | None
+        normalization: Literal[
+            "standard",
+            "image",
+            "image_per_channel",
+            "min_max",
+            "min_max_per_channel",
+        ]
 
-    def apply(self, img, **params):
-        return F.center_crop(img, self.height, self.width)
-
-    def apply_to_bbox(self, bbox, **params):
-        return F.bbox_center_crop(bbox, self.height, self.width, **params)
-
-    def apply_to_keypoint(self, keypoint, **params):
-        return F.keypoint_center_crop(keypoint, self.height, self.width, **params)
-
-    def get_transform_init_args_names(self):
-        return ("height", "width")
-
-
-class RandomCrop(DualTransform):
-    """Crop a random part of the input.
-
-    Args:
-        height (int): height of the crop.
-        width (int): width of the crop.
-        p (float): probability of applying the transform. Default: 1.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, height, width, always_apply=False, p=1.0):
-        super(RandomCrop, self).__init__(always_apply, p)
-        self.height = height
-        self.width = width
-
-    def apply(self, img, h_start=0, w_start=0, **params):
-        return F.random_crop(img, self.height, self.width, h_start, w_start)
-
-    def get_params(self):
-        return {"h_start": random.random(), "w_start": random.random()}
-
-    def apply_to_bbox(self, bbox, **params):
-        return F.bbox_random_crop(bbox, self.height, self.width, **params)
-
-    def apply_to_keypoint(self, keypoint, **params):
-        return F.keypoint_random_crop(keypoint, self.height, self.width, **params)
-
-    def get_transform_init_args_names(self):
-        return ("height", "width")
-
-
-class RandomCropNearBBox(DualTransform):
-    """Crop bbox from image with random shift by x,y coordinates
-
-    Args:
-        max_part_shift (float): float value in (0.0, 1.0) range. Default 0.3
-        p (float): probability of applying the transform. Default: 1.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, max_part_shift=0.3, always_apply=False, p=1.0):
-        super(RandomCropNearBBox, self).__init__(always_apply, p)
-        self.max_part_shift = max_part_shift
-
-    def apply(self, img, x_min=0, x_max=0, y_min=0, y_max=0, **params):
-        return F.clamping_crop(img, x_min, y_min, x_max, y_max)
-
-    def get_params_dependent_on_targets(self, params):
-        bbox = params["cropping_bbox"]
-        h_max_shift = int((bbox[3] - bbox[1]) * self.max_part_shift)
-        w_max_shift = int((bbox[2] - bbox[0]) * self.max_part_shift)
-
-        x_min = bbox[0] - random.randint(-w_max_shift, w_max_shift)
-        x_max = bbox[2] + random.randint(-w_max_shift, w_max_shift)
-
-        y_min = bbox[1] - random.randint(-h_max_shift, h_max_shift)
-        y_max = bbox[3] + random.randint(-h_max_shift, h_max_shift)
-
-        return {"x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max}
-
-    def apply_to_bbox(self, bbox, x_min=0, x_max=0, y_min=0, y_max=0, **params):
-        h_start = y_min
-        w_start = x_min
-        return F.bbox_crop(bbox, y_max - y_min, x_max - x_min, h_start, w_start, **params)
-
-    def apply_to_keypoint(self, keypoint, x_min=0, x_max=0, y_min=0, y_max=0, **params):
-        return F.crop_keypoint_by_coords(
-            keypoint,
-            crop_coords=(x_min, y_min, x_max, y_max),
-            crop_height=y_max - y_min,
-            crop_width=x_max - x_min,
-            rows=params["rows"],
-            cols=params["cols"],
-        )
-
-    @property
-    def targets_as_params(self):
-        return ["cropping_bbox"]
-
-    def get_transform_init_args_names(self):
-        return ("max_part_shift",)
-
-
-class _BaseRandomSizedCrop(DualTransform):
-    # Base class for RandomSizedCrop and RandomResizedCrop
-
-    def __init__(self, height, width, interpolation=cv2.INTER_LINEAR, always_apply=False, p=1.0):
-        super(_BaseRandomSizedCrop, self).__init__(always_apply, p)
-        self.height = height
-        self.width = width
-        self.interpolation = interpolation
-
-    def apply(self, img, crop_height=0, crop_width=0, h_start=0, w_start=0, interpolation=cv2.INTER_LINEAR, **params):
-        crop = F.random_crop(img, crop_height, crop_width, h_start, w_start)
-        return F.resize(crop, self.height, self.width, interpolation)
-
-    def apply_to_bbox(self, bbox, crop_height=0, crop_width=0, h_start=0, w_start=0, rows=0, cols=0, **params):
-        return F.bbox_random_crop(bbox, crop_height, crop_width, h_start, w_start, rows, cols)
-
-    def apply_to_keypoint(self, keypoint, crop_height=0, crop_width=0, h_start=0, w_start=0, rows=0, cols=0, **params):
-        keypoint = F.keypoint_random_crop(keypoint, crop_height, crop_width, h_start, w_start, rows, cols)
-        scale_x = self.width / crop_width
-        scale_y = self.height / crop_height
-        keypoint = F.keypoint_scale(keypoint, scale_x, scale_y)
-        return keypoint
-
-
-class RandomSizedCrop(_BaseRandomSizedCrop):
-    """Crop a random part of the input and rescale it to some size.
-
-    Args:
-        min_max_height ((int, int)): crop size limits.
-        height (int): height after crop and resize.
-        width (int): width after crop and resize.
-        w2h_ratio (float): aspect ratio of crop.
-        interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
-            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
-            Default: cv2.INTER_LINEAR.
-        p (float): probability of applying the transform. Default: 1.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(
-        self, min_max_height, height, width, w2h_ratio=1.0, interpolation=cv2.INTER_LINEAR, always_apply=False, p=1.0
-    ):
-        super(RandomSizedCrop, self).__init__(
-            height=height, width=width, interpolation=interpolation, always_apply=always_apply, p=p
-        )
-        self.min_max_height = min_max_height
-        self.w2h_ratio = w2h_ratio
-
-    def get_params(self):
-        crop_height = random.randint(self.min_max_height[0], self.min_max_height[1])
-        return {
-            "h_start": random.random(),
-            "w_start": random.random(),
-            "crop_height": crop_height,
-            "crop_width": int(crop_height * self.w2h_ratio),
-        }
-
-    def get_transform_init_args_names(self):
-        return "min_max_height", "height", "width", "w2h_ratio", "interpolation"
-
-
-class RandomResizedCrop(_BaseRandomSizedCrop):
-    """Torchvision's variant of crop a random part of the input and rescale it to some size.
-
-    Args:
-        height (int): height after crop and resize.
-        width (int): width after crop and resize.
-        scale ((float, float)): range of size of the origin size cropped
-        ratio ((float, float)): range of aspect ratio of the origin aspect ratio cropped
-        interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
-            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
-            Default: cv2.INTER_LINEAR.
-        p (float): probability of applying the transform. Default: 1.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
+        @model_validator(mode="after")
+        def validate_normalization(self) -> Self:
+            if (
+                self.mean is None
+                or self.std is None
+                or self.max_pixel_value is None
+                and self.normalization == "standard"
+            ):
+                raise ValueError("mean, std, and max_pixel_value must be provided for standard normalization.")
+            return self
 
     def __init__(
         self,
-        height,
-        width,
-        scale=(0.08, 1.0),
-        ratio=(0.75, 1.3333333333333333),
-        interpolation=cv2.INTER_LINEAR,
-        always_apply=False,
-        p=1.0,
+        mean: ColorType | None = (0.485, 0.456, 0.406),
+        std: ColorType | None = (0.229, 0.224, 0.225),
+        max_pixel_value: float | None = 255.0,
+        normalization: Literal["standard", "image", "image_per_channel", "min_max", "min_max_per_channel"] = "standard",
+        always_apply: bool | None = None,
+        p: float = 1.0,
     ):
-
-        super(RandomResizedCrop, self).__init__(
-            height=height, width=width, interpolation=interpolation, always_apply=always_apply, p=p
-        )
-        self.scale = scale
-        self.ratio = ratio
-
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-        area = img.shape[0] * img.shape[1]
-
-        for _attempt in range(10):
-            target_area = random.uniform(*self.scale) * area
-            log_ratio = (math.log(self.ratio[0]), math.log(self.ratio[1]))
-            aspect_ratio = math.exp(random.uniform(*log_ratio))
-
-            w = int(round(math.sqrt(target_area * aspect_ratio)))
-            h = int(round(math.sqrt(target_area / aspect_ratio)))
-
-            if 0 < w <= img.shape[1] and 0 < h <= img.shape[0]:
-                i = random.randint(0, img.shape[0] - h)
-                j = random.randint(0, img.shape[1] - w)
-                return {
-                    "crop_height": h,
-                    "crop_width": w,
-                    "h_start": i * 1.0 / (img.shape[0] - h + 1e-10),
-                    "w_start": j * 1.0 / (img.shape[1] - w + 1e-10),
-                }
-
-        # Fallback to central crop
-        in_ratio = img.shape[1] / img.shape[0]
-        if in_ratio < min(self.ratio):
-            w = img.shape[1]
-            h = int(round(w / min(self.ratio)))
-        elif in_ratio > max(self.ratio):
-            h = img.shape[0]
-            w = int(round(h * max(self.ratio)))
-        else:  # whole image
-            w = img.shape[1]
-            h = img.shape[0]
-        i = (img.shape[0] - h) // 2
-        j = (img.shape[1] - w) // 2
-        return {
-            "crop_height": h,
-            "crop_width": w,
-            "h_start": i * 1.0 / (img.shape[0] - h + 1e-10),
-            "w_start": j * 1.0 / (img.shape[1] - w + 1e-10),
-        }
-
-    def get_params(self):
-        return {}
-
-    @property
-    def targets_as_params(self):
-        return ["image"]
-
-    def get_transform_init_args_names(self):
-        return "height", "width", "scale", "ratio", "interpolation"
-
-
-class RandomSizedBBoxSafeCrop(DualTransform):
-    """Crop a random part of the input and rescale it to some size without loss of bboxes.
-
-    Args:
-        height (int): height after crop and resize.
-        width (int): width after crop and resize.
-        erosion_rate (float): erosion rate applied on input image height before crop.
-        interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
-            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
-            Default: cv2.INTER_LINEAR.
-        p (float): probability of applying the transform. Default: 1.
-
-    Targets:
-        image, mask, bboxes
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, height, width, erosion_rate=0.0, interpolation=cv2.INTER_LINEAR, always_apply=False, p=1.0):
-        super(RandomSizedBBoxSafeCrop, self).__init__(always_apply, p)
-        self.height = height
-        self.width = width
-        self.interpolation = interpolation
-        self.erosion_rate = erosion_rate
-
-    def apply(self, img, crop_height=0, crop_width=0, h_start=0, w_start=0, interpolation=cv2.INTER_LINEAR, **params):
-        crop = F.random_crop(img, crop_height, crop_width, h_start, w_start)
-        return F.resize(crop, self.height, self.width, interpolation)
-
-    def get_params_dependent_on_targets(self, params):
-        img_h, img_w = params["image"].shape[:2]
-        if len(params["bboxes"]) == 0:  # less likely, this class is for use with bboxes.
-            erosive_h = int(img_h * (1.0 - self.erosion_rate))
-            crop_height = img_h if erosive_h >= img_h else random.randint(erosive_h, img_h)
-            return {
-                "h_start": random.random(),
-                "w_start": random.random(),
-                "crop_height": crop_height,
-                "crop_width": int(crop_height * img_w / img_h),
-            }
-        # get union of all bboxes
-        x, y, x2, y2 = union_of_bboxes(
-            width=img_w, height=img_h, bboxes=params["bboxes"], erosion_rate=self.erosion_rate
-        )
-        # find bigger region
-        bx, by = x * random.random(), y * random.random()
-        bx2, by2 = x2 + (1 - x2) * random.random(), y2 + (1 - y2) * random.random()
-        bw, bh = bx2 - bx, by2 - by
-        crop_height = img_h if bh >= 1.0 else int(img_h * bh)
-        crop_width = img_w if bw >= 1.0 else int(img_w * bw)
-        h_start = np.clip(0.0 if bh >= 1.0 else by / (1.0 - bh), 0.0, 1.0)
-        w_start = np.clip(0.0 if bw >= 1.0 else bx / (1.0 - bw), 0.0, 1.0)
-        return {"h_start": h_start, "w_start": w_start, "crop_height": crop_height, "crop_width": crop_width}
-
-    def apply_to_bbox(self, bbox, crop_height=0, crop_width=0, h_start=0, w_start=0, rows=0, cols=0, **params):
-        return F.bbox_random_crop(bbox, crop_height, crop_width, h_start, w_start, rows, cols)
-
-    @property
-    def targets_as_params(self):
-        return ["image", "bboxes"]
-
-    def get_transform_init_args_names(self):
-        return ("height", "width", "erosion_rate", "interpolation")
-
-
-class CropNonEmptyMaskIfExists(DualTransform):
-    """Crop area with mask if mask is non-empty, else make random crop.
-
-    Args:
-        height (int): vertical size of crop in pixels
-        width (int): horizontal size of crop in pixels
-        ignore_values (list of int): values to ignore in mask, `0` values are always ignored
-            (e.g. if background value is 5 set `ignore_values=[5]` to ignore)
-        ignore_channels (list of int): channels to ignore in mask
-            (e.g. if background is a first channel set `ignore_channels=[0]` to ignore)
-        p (float): probability of applying the transform. Default: 1.0.
-
-    Targets:
-        image, mask, bboxes, keypoints
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, height, width, ignore_values=None, ignore_channels=None, always_apply=False, p=1.0):
-        super(CropNonEmptyMaskIfExists, self).__init__(always_apply, p)
-
-        if ignore_values is not None and not isinstance(ignore_values, list):
-            raise ValueError("Expected `ignore_values` of type `list`, got `{}`".format(type(ignore_values)))
-        if ignore_channels is not None and not isinstance(ignore_channels, list):
-            raise ValueError("Expected `ignore_channels` of type `list`, got `{}`".format(type(ignore_channels)))
-
-        self.height = height
-        self.width = width
-        self.ignore_values = ignore_values
-        self.ignore_channels = ignore_channels
-
-    def apply(self, img, x_min=0, x_max=0, y_min=0, y_max=0, **params):
-        return F.crop(img, x_min, y_min, x_max, y_max)
-
-    def apply_to_bbox(self, bbox, x_min=0, x_max=0, y_min=0, y_max=0, **params):
-        return F.bbox_crop(
-            bbox, x_min=x_min, x_max=x_max, y_min=y_min, y_max=y_max, rows=params["rows"], cols=params["cols"]
-        )
-
-    def apply_to_keypoint(self, keypoint, x_min=0, x_max=0, y_min=0, y_max=0, **params):
-        return F.crop_keypoint_by_coords(
-            keypoint,
-            crop_coords=[x_min, y_min, x_max, y_max],
-            crop_height=y_max - y_min,
-            crop_width=x_max - x_min,
-            rows=params["rows"],
-            cols=params["cols"],
-        )
-
-    @property
-    def targets_as_params(self):
-        return ["mask"]
-
-    def get_params_dependent_on_targets(self, params):
-        mask = params["mask"]
-        mask_height, mask_width = mask.shape[:2]
-
-        if self.ignore_values is not None:
-            ignore_values_np = np.array(self.ignore_values)
-            mask = np.where(np.isin(mask, ignore_values_np), 0, mask)
-
-        if mask.ndim == 3 and self.ignore_channels is not None:
-            target_channels = np.array([ch for ch in range(mask.shape[-1]) if ch not in self.ignore_channels])
-            mask = np.take(mask, target_channels, axis=-1)
-
-        if self.height > mask_height or self.width > mask_width:
-            raise ValueError(
-                "Crop size ({},{}) is larger than image ({},{})".format(
-                    self.height, self.width, mask_height, mask_width
-                )
-            )
-
-        if mask.sum() == 0:
-            x_min = random.randint(0, mask_width - self.width)
-            y_min = random.randint(0, mask_height - self.height)
-        else:
-            mask = mask.sum(axis=-1) if mask.ndim == 3 else mask
-            non_zero_yx = np.argwhere(mask)
-            y, x = random.choice(non_zero_yx)
-            x_min = x - random.randint(0, self.width - 1)
-            y_min = y - random.randint(0, self.height - 1)
-            x_min = np.clip(x_min, 0, mask_width - self.width)
-            y_min = np.clip(y_min, 0, mask_height - self.height)
-
-        x_max = x_min + self.width
-        y_max = y_min + self.height
-
-        return {"x_min": x_min, "x_max": x_max, "y_min": y_min, "y_max": y_max}
-
-    def get_transform_init_args_names(self):
-        return ("height", "width", "ignore_values", "ignore_channels")
-
-
-class OpticalDistortion(DualTransform):
-    """
-    Args:
-        distort_limit (float, (float, float)): If distort_limit is a single float, the range
-            will be (-distort_limit, distort_limit). Default: (-0.05, 0.05).
-        shift_limit (float, (float, float))): If shift_limit is a single float, the range
-            will be (-shift_limit, shift_limit). Default: (-0.05, 0.05).
-        interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
-            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
-            Default: cv2.INTER_LINEAR.
-        border_mode (OpenCV flag): flag that is used to specify the pixel extrapolation method. Should be one of:
-            cv2.BORDER_CONSTANT, cv2.BORDER_REPLICATE, cv2.BORDER_REFLECT, cv2.BORDER_WRAP, cv2.BORDER_REFLECT_101.
-            Default: cv2.BORDER_REFLECT_101
-        value (int, float, list of ints, list of float): padding value if border_mode is cv2.BORDER_CONSTANT.
-        mask_value (int, float,
-                    list of ints,
-                    list of float): padding value if border_mode is cv2.BORDER_CONSTANT applied for masks.
-
-    Targets:
-        image, mask
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(
-        self,
-        distort_limit=0.05,
-        shift_limit=0.05,
-        interpolation=cv2.INTER_LINEAR,
-        border_mode=cv2.BORDER_REFLECT_101,
-        value=None,
-        mask_value=None,
-        always_apply=False,
-        p=0.5,
-    ):
-        super(OpticalDistortion, self).__init__(always_apply, p)
-        self.shift_limit = to_tuple(shift_limit)
-        self.distort_limit = to_tuple(distort_limit)
-        self.interpolation = interpolation
-        self.border_mode = border_mode
-        self.value = value
-        self.mask_value = mask_value
-
-    def apply(self, img, k=0, dx=0, dy=0, interpolation=cv2.INTER_LINEAR, **params):
-        return F.optical_distortion(img, k, dx, dy, interpolation, self.border_mode, self.value)
-
-    def apply_to_mask(self, img, k=0, dx=0, dy=0, **params):
-        return F.optical_distortion(img, k, dx, dy, cv2.INTER_NEAREST, self.border_mode, self.mask_value)
-
-    def get_params(self):
-        return {
-            "k": random.uniform(self.distort_limit[0], self.distort_limit[1]),
-            "dx": round(random.uniform(self.shift_limit[0], self.shift_limit[1])),
-            "dy": round(random.uniform(self.shift_limit[0], self.shift_limit[1])),
-        }
-
-    def get_transform_init_args_names(self):
-        return ("distort_limit", "shift_limit", "interpolation", "border_mode", "value", "mask_value")
-
-
-class GridDistortion(DualTransform):
-    """
-    Args:
-        num_steps (int): count of grid cells on each side.
-        distort_limit (float, (float, float)): If distort_limit is a single float, the range
-            will be (-distort_limit, distort_limit). Default: (-0.03, 0.03).
-        interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
-            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
-            Default: cv2.INTER_LINEAR.
-        border_mode (OpenCV flag): flag that is used to specify the pixel extrapolation method. Should be one of:
-            cv2.BORDER_CONSTANT, cv2.BORDER_REPLICATE, cv2.BORDER_REFLECT, cv2.BORDER_WRAP, cv2.BORDER_REFLECT_101.
-            Default: cv2.BORDER_REFLECT_101
-        value (int, float, list of ints, list of float): padding value if border_mode is cv2.BORDER_CONSTANT.
-        mask_value (int, float,
-                    list of ints,
-                    list of float): padding value if border_mode is cv2.BORDER_CONSTANT applied for masks.
-
-    Targets:
-        image, mask
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(
-        self,
-        num_steps=5,
-        distort_limit=0.3,
-        interpolation=cv2.INTER_LINEAR,
-        border_mode=cv2.BORDER_REFLECT_101,
-        value=None,
-        mask_value=None,
-        always_apply=False,
-        p=0.5,
-    ):
-        super(GridDistortion, self).__init__(always_apply, p)
-        self.num_steps = num_steps
-        self.distort_limit = to_tuple(distort_limit)
-        self.interpolation = interpolation
-        self.border_mode = border_mode
-        self.value = value
-        self.mask_value = mask_value
-
-    def apply(self, img, stepsx=[], stepsy=[], interpolation=cv2.INTER_LINEAR, **params):
-        return F.grid_distortion(img, self.num_steps, stepsx, stepsy, interpolation, self.border_mode, self.value)
-
-    def apply_to_mask(self, img, stepsx=[], stepsy=[], **params):
-        return F.grid_distortion(
-            img, self.num_steps, stepsx, stepsy, cv2.INTER_NEAREST, self.border_mode, self.mask_value
-        )
-
-    def get_params(self):
-        stepsx = [1 + random.uniform(self.distort_limit[0], self.distort_limit[1]) for i in range(self.num_steps + 1)]
-        stepsy = [1 + random.uniform(self.distort_limit[0], self.distort_limit[1]) for i in range(self.num_steps + 1)]
-        return {"stepsx": stepsx, "stepsy": stepsy}
-
-    def get_transform_init_args_names(self):
-        return ("num_steps", "distort_limit", "interpolation", "border_mode", "value", "mask_value")
-
-
-class ElasticTransform(DualTransform):
-    """Elastic deformation of images as described in [Simard2003]_ (with modifications).
-    Based on https://gist.github.com/erniejunior/601cdf56d2b424757de5
-
-    .. [Simard2003] Simard, Steinkraus and Platt, "Best Practices for
-         Convolutional Neural Networks applied to Visual Document Analysis", in
-         Proc. of the International Conference on Document Analysis and
-         Recognition, 2003.
-
-    Args:
-        alpha (float):
-        sigma (float): Gaussian filter parameter.
-        alpha_affine (float): The range will be (-alpha_affine, alpha_affine)
-        interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
-            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
-            Default: cv2.INTER_LINEAR.
-        border_mode (OpenCV flag): flag that is used to specify the pixel extrapolation method. Should be one of:
-            cv2.BORDER_CONSTANT, cv2.BORDER_REPLICATE, cv2.BORDER_REFLECT, cv2.BORDER_WRAP, cv2.BORDER_REFLECT_101.
-            Default: cv2.BORDER_REFLECT_101
-        value (int, float, list of ints, list of float): padding value if border_mode is cv2.BORDER_CONSTANT.
-        mask_value (int, float,
-                    list of ints,
-                    list of float): padding value if border_mode is cv2.BORDER_CONSTANT applied for masks.
-        approximate (boolean): Whether to smooth displacement map with fixed kernel size.
-                               Enabling this option gives ~2X speedup on large images.
-
-    Targets:
-        image, mask
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(
-        self,
-        alpha=1,
-        sigma=50,
-        alpha_affine=50,
-        interpolation=cv2.INTER_LINEAR,
-        border_mode=cv2.BORDER_REFLECT_101,
-        value=None,
-        mask_value=None,
-        always_apply=False,
-        approximate=False,
-        p=0.5,
-    ):
-        super(ElasticTransform, self).__init__(always_apply, p)
-        self.alpha = alpha
-        self.alpha_affine = alpha_affine
-        self.sigma = sigma
-        self.interpolation = interpolation
-        self.border_mode = border_mode
-        self.value = value
-        self.mask_value = mask_value
-        self.approximate = approximate
-
-    def apply(self, img, random_state=None, interpolation=cv2.INTER_LINEAR, **params):
-        return F.elastic_transform(
-            img,
-            self.alpha,
-            self.sigma,
-            self.alpha_affine,
-            interpolation,
-            self.border_mode,
-            self.value,
-            np.random.RandomState(random_state),
-            self.approximate,
-        )
-
-    def apply_to_mask(self, img, random_state=None, **params):
-        return F.elastic_transform(
-            img,
-            self.alpha,
-            self.sigma,
-            self.alpha_affine,
-            cv2.INTER_NEAREST,
-            self.border_mode,
-            self.mask_value,
-            np.random.RandomState(random_state),
-            self.approximate,
-        )
-
-    def get_params(self):
-        return {"random_state": random.randint(0, 10000)}
-
-    def get_transform_init_args_names(self):
-        return ("alpha", "sigma", "alpha_affine", "interpolation", "border_mode", "value", "mask_value", "approximate")
-
-
-class RandomGridShuffle(DualTransform):
-    """
-    Random shuffle grid's cells on image.
-
-    Args:
-        grid ((int, int)): size of grid for splitting image.
-
-    Targets:
-        image, mask
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, grid=(3, 3), always_apply=False, p=0.5):
-        super(RandomGridShuffle, self).__init__(always_apply, p)
-        self.grid = grid
-
-    def apply(self, img, tiles=None, **params):
-        if tiles is None:
-            tiles = []
-
-        return F.swap_tiles_on_image(img, tiles)
-
-    def apply_to_mask(self, img, tiles=None, **params):
-        if tiles is None:
-            tiles = []
-
-        return F.swap_tiles_on_image(img, tiles)
-
-    def get_params_dependent_on_targets(self, params):
-        height, width = params["image"].shape[:2]
-        n, m = self.grid
-
-        if n <= 0 or m <= 0:
-            raise ValueError("Grid's values must be positive. Current grid [%s, %s]" % (n, m))
-
-        if n > height // 2 or m > width // 2:
-            raise ValueError("Incorrect size cell of grid. Just shuffle pixels of image")
-
-        random_state = np.random.RandomState(random.randint(0, 10000))
-
-        height_split = np.linspace(0, height, n + 1, dtype=np.int)
-        width_split = np.linspace(0, width, m + 1, dtype=np.int)
-
-        height_matrix, width_matrix = np.meshgrid(height_split, width_split, indexing="ij")
-
-        index_height_matrix = height_matrix[:-1, :-1]
-        index_width_matrix = width_matrix[:-1, :-1]
-
-        shifted_index_height_matrix = height_matrix[1:, 1:]
-        shifted_index_width_matrix = width_matrix[1:, 1:]
-
-        height_tile_sizes = shifted_index_height_matrix - index_height_matrix
-        width_tile_sizes = shifted_index_width_matrix - index_width_matrix
-
-        tiles_sizes = np.stack((height_tile_sizes, width_tile_sizes), axis=2)
-
-        index_matrix = np.indices((n, m))
-        new_index_matrix = np.stack(index_matrix, axis=2)
-
-        for bbox_size in np.unique(tiles_sizes.reshape(-1, 2), axis=0):
-            eq_mat = np.all(tiles_sizes == bbox_size, axis=2)
-            new_index_matrix[eq_mat] = random_state.permutation(new_index_matrix[eq_mat])
-
-        new_index_matrix = np.split(new_index_matrix, 2, axis=2)
-
-        old_x = index_height_matrix[new_index_matrix[0], new_index_matrix[1]].reshape(-1)
-        old_y = index_width_matrix[new_index_matrix[0], new_index_matrix[1]].reshape(-1)
-
-        shift_x = height_tile_sizes.reshape(-1)
-        shift_y = width_tile_sizes.reshape(-1)
-
-        curr_x = index_height_matrix.reshape(-1)
-        curr_y = index_width_matrix.reshape(-1)
-
-        tiles = np.stack([curr_x, curr_y, old_x, old_y, shift_x, shift_y], axis=1)
-
-        return {"tiles": tiles}
-
-    @property
-    def targets_as_params(self):
-        return ["image"]
-
-    def get_transform_init_args_names(self):
-        return ("grid",)
-
-
-class Normalize(ImageOnlyTransform):
-    """Divide pixel values by 255 = 2**8 - 1, subtract mean per channel and divide by std per channel.
-
-    Args:
-        mean (float, list of float): mean values
-        std  (float, list of float): std values
-        max_pixel_value (float): maximum possible pixel value
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(
-        self, mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225), max_pixel_value=255.0, always_apply=False, p=1.0
-    ):
-        super(Normalize, self).__init__(always_apply, p)
+        super().__init__(p=p, always_apply=always_apply)
         self.mean = mean
+        self.mean_np = np.array(mean, dtype=np.float32) * max_pixel_value
         self.std = std
+        self.denominator = np.reciprocal(np.array(std, dtype=np.float32) * max_pixel_value)
         self.max_pixel_value = max_pixel_value
+        self.normalization = normalization
 
-    def apply(self, image, **params):
-        return F.normalize(image, self.mean, self.std, self.max_pixel_value)
+    def apply(self, img: np.ndarray, **params: Any) -> np.ndarray:
+        if self.normalization == "standard":
+            return normalize(
+                img,
+                self.mean_np,
+                self.denominator,
+            )
+        return normalize_per_image(img, self.normalization)
 
-    def get_transform_init_args_names(self):
-        return ("mean", "std", "max_pixel_value")
-
-
-class Cutout(ImageOnlyTransform):
-    """CoarseDropout of the square regions in the image.
-
-    Args:
-        num_holes (int): number of regions to zero out
-        max_h_size (int): maximum height of the hole
-        max_w_size (int): maximum width of the hole
-        fill_value (int, float, lisf of int, list of float): value for dropped pixels.
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-
-    Reference:
-    |  https://arxiv.org/abs/1708.04552
-    |  https://github.com/uoguelph-mlrg/Cutout/blob/master/util/cutout.py
-    |  https://github.com/aleju/imgaug/blob/master/imgaug/augmenters/arithmetic.py
-    """
-
-    def __init__(self, num_holes=8, max_h_size=8, max_w_size=8, fill_value=0, always_apply=False, p=0.5):
-        super(Cutout, self).__init__(always_apply, p)
-        self.num_holes = num_holes
-        self.max_h_size = max_h_size
-        self.max_w_size = max_w_size
-        self.fill_value = fill_value
-        warnings.warn("This class has been deprecated. Please use CoarseDropout", DeprecationWarning)
-
-    def apply(self, image, fill_value=0, holes=[], **params):
-        return F.cutout(image, holes, fill_value)
-
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-        height, width = img.shape[:2]
-
-        holes = []
-        for _n in range(self.num_holes):
-            y = random.randint(0, height)
-            x = random.randint(0, width)
-
-            y1 = np.clip(y - self.max_h_size // 2, 0, height)
-            y2 = np.clip(y + self.max_h_size // 2, 0, height)
-            x1 = np.clip(x - self.max_w_size // 2, 0, width)
-            x2 = np.clip(x + self.max_w_size // 2, 0, width)
-            holes.append((x1, y1, x2, y2))
-
-        return {"holes": holes}
-
-    @property
-    def targets_as_params(self):
-        return ["image"]
-
-    def get_transform_init_args_names(self):
-        return ("num_holes", "max_h_size", "max_w_size")
-
-
-class CoarseDropout(ImageOnlyTransform):
-    """CoarseDropout of the rectangular regions in the image.
-
-    Args:
-        max_holes (int): Maximum number of regions to zero out.
-        max_height (int): Maximum height of the hole.
-        min_width (int): Maximum width of the hole.
-        min_holes (int): Minimum number of regions to zero out. If `None`,
-            `min_holes` is be set to `max_holes`. Default: `None`.
-        min_height (int): Minimum height of the hole. Default: None. If `None`,
-            `min_height` is set to `max_height`. Default: `None`.
-        min_width (int): Minimum width of the hole. If `None`, `min_height` is
-            set to `max_width`. Default: `None`.
-        fill_value (int, float, lisf of int, list of float): value for dropped pixels.
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-
-    Reference:
-    |  https://arxiv.org/abs/1708.04552
-    |  https://github.com/uoguelph-mlrg/Cutout/blob/master/util/cutout.py
-    |  https://github.com/aleju/imgaug/blob/master/imgaug/augmenters/arithmetic.py
-
-    """
-
-    def __init__(
-        self,
-        max_holes=8,
-        max_height=8,
-        max_width=8,
-        min_holes=None,
-        min_height=None,
-        min_width=None,
-        fill_value=0,
-        always_apply=False,
-        p=0.5,
-    ):
-        super(CoarseDropout, self).__init__(always_apply, p)
-        self.max_holes = max_holes
-        self.max_height = max_height
-        self.max_width = max_width
-        self.min_holes = min_holes if min_holes is not None else max_holes
-        self.min_height = min_height if min_height is not None else max_height
-        self.min_width = min_width if min_width is not None else max_width
-        self.fill_value = fill_value
-        assert 0 < self.min_holes <= self.max_holes
-        assert 0 < self.min_height <= self.max_height
-        assert 0 < self.min_width <= self.max_width
-
-    def apply(self, image, fill_value=0, holes=[], **params):
-        return F.cutout(image, holes, fill_value)
-
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-        height, width = img.shape[:2]
-
-        holes = []
-        for _n in range(random.randint(self.min_holes, self.max_holes)):
-            hole_height = random.randint(self.min_height, self.max_height)
-            hole_width = random.randint(self.min_width, self.max_width)
-
-            y1 = random.randint(0, height - hole_height)
-            x1 = random.randint(0, width - hole_width)
-            y2 = y1 + hole_height
-            x2 = x1 + hole_width
-            holes.append((x1, y1, x2, y2))
-
-        return {"holes": holes}
-
-    @property
-    def targets_as_params(self):
-        return ["image"]
-
-    def get_transform_init_args_names(self):
-        return ("max_holes", "max_height", "max_width", "min_holes", "min_height", "min_width")
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return "mean", "std", "max_pixel_value", "normalization"
 
 
 class ImageCompression(ImageOnlyTransform):
-    """Decrease Jpeg, WebP compression of an image.
+    """Decrease image quality by applying JPEG or WebP compression.
+
+    This transform simulates the effect of saving an image with lower quality settings,
+    which can introduce compression artifacts. It's useful for data augmentation and
+    for testing model robustness against varying image qualities.
 
     Args:
-        quality_lower (float): lower bound on the image quality.
-                               Should be in [0, 100] range for jpeg and [1, 100] for webp.
-        quality_upper (float): upper bound on the image quality.
-                               Should be in [0, 100] range for jpeg and [1, 100] for webp.
-        compression_type (ImageCompressionType): should be ImageCompressionType.JPEG or ImageCompressionType.WEBP.
-            Defaul: ImageCompressionType.JPEG
+        quality_range (tuple[int, int]): Range for the compression quality.
+            The values should be in [1, 100] range, where:
+            - 1 is the lowest quality (maximum compression)
+            - 100 is the highest quality (minimum compression)
+            Default: (99, 100)
+
+        compression_type (Literal["jpeg", "webp"]): Type of compression to apply.
+            - "jpeg": JPEG compression
+            - "webp": WebP compression
+            Default: "jpeg"
+
+        p (float): Probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - This transform expects images with 1, 3, or 4 channels.
+        - For JPEG compression, alpha channels (4th channel) will be ignored.
+        - WebP compression supports transparency (4 channels).
+        - The actual file is not saved to disk; the compression is simulated in memory.
+        - Lower quality values result in smaller file sizes but may introduce visible artifacts.
+        - This transform can be useful for:
+          * Data augmentation to improve model robustness
+          * Testing how models perform on images of varying quality
+          * Simulating images transmitted over low-bandwidth connections
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>> transform = A.ImageCompression(quality_range=(50, 90), compression_type=0, p=1.0)
+        >>> result = transform(image=image)
+        >>> compressed_image = result["image"]
+
+    References:
+        - JPEG compression: https://en.wikipedia.org/wiki/JPEG
+        - WebP compression: https://developers.google.com/speed/webp
     """
 
-    class ImageCompressionType(Enum):
-        JPEG = 0
-        WEBP = 1
+    class InitSchema(BaseTransformInitSchema):
+        quality_range: Annotated[tuple[int, int], AfterValidator(check_1plus), AfterValidator(nondecreasing)]
+
+        quality_lower: int | None = Field(
+            ge=1,
+            le=100,
+        )
+        quality_upper: int | None = Field(
+            ge=1,
+            le=100,
+        )
+        compression_type: Literal["jpeg", "webp"]
+
+        @model_validator(mode="after")
+        def validate_ranges(self) -> Self:
+            # Update the quality_range based on the non-None values of quality_lower and quality_upper
+            if self.quality_lower is not None or self.quality_upper is not None:
+                if self.quality_lower is not None:
+                    warn(
+                        "`quality_lower` is deprecated. Use `quality_range` as tuple"
+                        " (quality_lower, quality_upper) instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                if self.quality_upper is not None:
+                    warn(
+                        "`quality_upper` is deprecated. Use `quality_range` as tuple"
+                        " (quality_lower, quality_upper) instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                lower = self.quality_lower if self.quality_lower is not None else self.quality_range[0]
+                upper = self.quality_upper if self.quality_upper is not None else self.quality_range[1]
+                self.quality_range = (lower, upper)
+                # Clear the deprecated individual quality settings
+                self.quality_lower = None
+                self.quality_upper = None
+
+            # Validate the quality_range
+            if not (1 <= self.quality_range[0] <= MAX_JPEG_QUALITY and 1 <= self.quality_range[1] <= MAX_JPEG_QUALITY):
+                raise ValueError(f"Quality range values should be within [1, {MAX_JPEG_QUALITY}] range.")
+
+            return self
 
     def __init__(
         self,
-        quality_lower=99,
-        quality_upper=100,
-        compression_type=ImageCompressionType.JPEG,
-        always_apply=False,
-        p=0.5,
+        quality_lower: int | None = None,
+        quality_upper: int | None = None,
+        compression_type: Literal["jpeg", "webp"] = "jpeg",
+        quality_range: tuple[int, int] = (99, 100),
+        always_apply: bool | None = None,
+        p: float = 0.5,
     ):
-        super(ImageCompression, self).__init__(always_apply, p)
-
+        super().__init__(p=p, always_apply=always_apply)
+        self.quality_range = quality_range
         self.compression_type = compression_type
-        low_thresh_quality_assert = 0
 
-        if self.compression_type == ImageCompression.ImageCompressionType.WEBP:
-            low_thresh_quality_assert = 1
+    def apply(self, img: np.ndarray, quality: int, image_type: Literal[".jpg", ".webp"], **params: Any) -> np.ndarray:
+        return fmain.image_compression(img, quality, image_type)
 
-        assert low_thresh_quality_assert <= quality_lower <= 100
-        assert low_thresh_quality_assert <= quality_upper <= 100
-
-        self.quality_lower = quality_lower
-        self.quality_upper = quality_upper
-
-    def apply(self, image, quality=100, image_type=".jpg", **params):
-        return F.image_compression(image, quality, image_type)
-
-    def get_params(self):
-        image_type = ".jpg"
-
-        if self.compression_type == ImageCompression.ImageCompressionType.WEBP:
+    def get_params(self) -> dict[str, int | str]:
+        if self.compression_type == "jpeg":
+            image_type = ".jpg"
+        elif self.compression_type == "webp":
             image_type = ".webp"
+        else:
+            raise ValueError(f"Unknown image compression type: {self.compression_type}")
 
-        return {"quality": random.randint(self.quality_lower, self.quality_upper), "image_type": image_type}
+        return {
+            "quality": random.randint(*self.quality_range),
+            "image_type": image_type,
+        }
 
-    def get_transform_init_args_names(self):
-        return ("quality_lower", "quality_upper", "compression_type")
-
-
-class JpegCompression(ImageCompression):
-    """Decrease Jpeg compression of an image.
-
-    Args:
-        quality_lower (float): lower bound on the jpeg quality. Should be in [0, 100] range
-        quality_upper (float): upper bound on the jpeg quality. Should be in [0, 100] range
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, quality_lower=99, quality_upper=100, always_apply=False, p=0.5):
-        super(JpegCompression, self).__init__(
-            quality_lower=quality_lower,
-            quality_upper=quality_upper,
-            compression_type=ImageCompression.ImageCompressionType.JPEG,
-            always_apply=always_apply,
-            p=p,
-        )
-        warnings.warn("This class has been deprecated. Please use ImageCompression", DeprecationWarning)
-
-    def get_transform_init_args(self):
-        return {"quality_lower": self.quality_lower, "quality_upper": self.quality_upper}
+    def get_transform_init_args(self) -> dict[str, Any]:
+        return {
+            "quality_range": self.quality_range,
+            "compression_type": self.compression_type,
+        }
 
 
 class RandomSnow(ImageOnlyTransform):
-    """Bleach out some pixel values simulating snow.
+    """Applies a random snow effect to the input image.
 
-    From https://github.com/UjjwalSaxena/Automold--Road-Augmentation-Library
+    This transform simulates snowfall by either bleaching out some pixel values or
+    adding a snow texture to the image, depending on the chosen method.
 
     Args:
-        snow_point_lower (float): lower_bond of the amount of snow. Should be in [0, 1] range
-        snow_point_upper (float): upper_bond of the amount of snow. Should be in [0, 1] range
-        brightness_coeff (float): larger number will lead to a more snow on the image. Should be >= 0
+        snow_point_range (tuple[float, float]): Range for the snow point threshold.
+            Both values should be in the (0, 1) range. Default: (0.1, 0.3).
+        brightness_coeff (float): Coefficient applied to increase the brightness of pixels
+            below the snow_point threshold. Larger values lead to more pronounced snow effects.
+            Should be > 0. Default: 2.5.
+        method (Literal["bleach", "texture"]): The snow simulation method to use. Options are:
+            - "bleach": Uses a simple pixel value thresholding technique.
+            - "texture": Applies a more realistic snow texture overlay.
+            Default: "texture".
+        p (float): Probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
+    Note:
+        - The "bleach" method increases the brightness of pixels above a certain threshold,
+          creating a simple snow effect. This method is faster but may look less realistic.
+        - The "texture" method creates a more realistic snow effect through the following steps:
+          1. Converts the image to HSV color space for better control over brightness.
+          2. Increases overall image brightness to simulate the reflective nature of snow.
+          3. Generates a snow texture using Gaussian noise, which is then smoothed with a Gaussian filter.
+          4. Applies a depth effect to the snow texture, making it more prominent at the top of the image.
+          5. Blends the snow texture with the original image using alpha compositing.
+          6. Adds a slight blue tint to simulate the cool color of snow.
+          7. Adds random sparkle effects to simulate light reflecting off snow crystals.
+          This method produces a more realistic result but is computationally more expensive.
+
+    Mathematical Formulation:
+        For the "bleach" method:
+        Let L be the lightness channel in HLS color space.
+        For each pixel (i, j):
+        If L[i, j] > snow_point:
+            L[i, j] = L[i, j] * brightness_coeff
+
+        For the "texture" method:
+        1. Brightness adjustment: V_new = V * (1 + brightness_coeff * snow_point)
+        2. Snow texture generation: T = GaussianFilter(GaussianNoise(μ=0.5, sigma=0.3))
+        3. Depth effect: D = LinearGradient(1.0 to 0.2)
+        4. Final pixel value: P = (1 - alpha) * original_pixel + alpha * (T * D * 255)
+           where alpha is the snow intensity factor derived from snow_point.
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+
+        # Default usage (bleach method)
+        >>> transform = A.RandomSnow(p=1.0)
+        >>> snowy_image = transform(image=image)["image"]
+
+        # Using texture method with custom parameters
+        >>> transform = A.RandomSnow(
+        ...     snow_point_range=(0.2, 0.4),
+        ...     brightness_coeff=2.0,
+        ...     method="texture",
+        ...     p=1.0
+        ... )
+        >>> snowy_image = transform(image=image)["image"]
+
+    References:
+        - Bleach method: https://github.com/UjjwalSaxena/Automold--Road-Augmentation-Library
+        - Texture method: Inspired by computer graphics techniques for snow rendering
+          and atmospheric scattering simulations.
     """
 
-    def __init__(self, snow_point_lower=0.1, snow_point_upper=0.3, brightness_coeff=2.5, always_apply=False, p=0.5):
-        super(RandomSnow, self).__init__(always_apply, p)
+    class InitSchema(BaseTransformInitSchema):
+        snow_point_range: Annotated[tuple[float, float], AfterValidator(check_01), AfterValidator(nondecreasing)]
 
-        assert 0 <= snow_point_lower <= snow_point_upper <= 1
-        assert 0 <= brightness_coeff
+        snow_point_lower: float | None = Field(
+            gt=0,
+            lt=1,
+        )
+        snow_point_upper: float | None = Field(
+            gt=0,
+            lt=1,
+        )
+        brightness_coeff: float = Field(gt=0)
+        method: Literal["bleach", "texture"]
 
-        self.snow_point_lower = snow_point_lower
-        self.snow_point_upper = snow_point_upper
-        self.brightness_coeff = brightness_coeff
+        @model_validator(mode="after")
+        def validate_ranges(self) -> Self:
+            if self.snow_point_lower is not None or self.snow_point_upper is not None:
+                if self.snow_point_lower is not None:
+                    warn(
+                        "`snow_point_lower` deprecated. Use `snow_point_range` as tuple"
+                        " (snow_point_lower, snow_point_upper) instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                if self.snow_point_upper is not None:
+                    warn(
+                        "`snow_point_upper` deprecated. Use `snow_point_range` as tuple"
+                        "(snow_point_lower, snow_point_upper) instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                lower = self.snow_point_lower if self.snow_point_lower is not None else self.snow_point_range[0]
+                upper = self.snow_point_upper if self.snow_point_upper is not None else self.snow_point_range[1]
+                self.snow_point_range = (lower, upper)
+                self.snow_point_lower = None
+                self.snow_point_upper = None
 
-    def apply(self, image, snow_point=0.1, **params):
-        return F.add_snow(image, snow_point, self.brightness_coeff)
+            # Validate the snow_point_range
+            if not (0 < self.snow_point_range[0] <= self.snow_point_range[1] < 1):
+                raise ValueError("snow_point_range values should be increasing within (0, 1) range.")
 
-    def get_params(self):
-        return {"snow_point": random.uniform(self.snow_point_lower, self.snow_point_upper)}
-
-    def get_transform_init_args_names(self):
-        return ("snow_point_lower", "snow_point_upper", "brightness_coeff")
-
-
-class RandomRain(ImageOnlyTransform):
-    """Adds rain effects.
-
-    From https://github.com/UjjwalSaxena/Automold--Road-Augmentation-Library
-
-    Args:
-        slant_lower: should be in range [-20, 20].
-        slant_upper: should be in range [-20, 20].
-        drop_length: should be in range [0, 100].
-        drop_width: should be in range [1, 5].
-        drop_color (list of (r, g, b)): rain lines color.
-        blur_value (int): rainy view are blurry
-        brightness_coefficient (float): rainy days are usually shady. Should be in range [0, 1].
-        rain_type: One of [None, "drizzle", "heavy", "torrestial"]
-
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-    """
+            return self
 
     def __init__(
         self,
-        slant_lower=-10,
-        slant_upper=10,
-        drop_length=20,
-        drop_width=1,
-        drop_color=(200, 200, 200),
-        blur_value=7,
-        brightness_coefficient=0.7,
-        rain_type=None,
-        always_apply=False,
-        p=0.5,
+        snow_point_lower: float | None = None,
+        snow_point_upper: float | None = None,
+        brightness_coeff: float = 2.5,
+        snow_point_range: tuple[float, float] = (0.1, 0.3),
+        method: Literal["bleach", "texture"] = "bleach",
+        always_apply: bool | None = None,
+        p: float = 0.5,
     ):
-        super(RandomRain, self).__init__(always_apply, p)
+        super().__init__(p=p, always_apply=always_apply)
 
-        assert rain_type in ["drizzle", "heavy", "torrential", None]
+        self.snow_point_range = snow_point_range
+        self.brightness_coeff = brightness_coeff
+        self.method = method
 
-        assert -20 <= slant_lower <= slant_upper <= 20
-        assert 1 <= drop_width <= 5
-        assert 0 <= drop_length <= 100
-        assert 0 <= brightness_coefficient <= 1
+    def apply(self, img: np.ndarray, snow_point: float, **params: Any) -> np.ndarray:
+        non_rgb_error(img)
 
-        self.slant_lower = slant_lower
-        self.slant_upper = slant_upper
+        if self.method == "bleach":
+            return fmain.add_snow_bleach(img, snow_point, self.brightness_coeff)
+        if self.method == "texture":
+            return fmain.add_snow_texture(img, snow_point, self.brightness_coeff)
 
+        raise ValueError(f"Unknown snow method: {self.method}")
+
+    def get_params(self) -> dict[str, np.ndarray]:
+        return {"snow_point": random.uniform(*self.snow_point_range)}
+
+    def get_transform_init_args_names(self) -> tuple[str, str]:
+        return "snow_point_range", "brightness_coeff"
+
+
+class RandomGravel(ImageOnlyTransform):
+    """Adds gravel-like artifacts to the input image.
+
+    This transform simulates the appearance of gravel or small stones scattered across
+    specific regions of an image. It's particularly useful for augmenting datasets of
+    road or terrain images, adding realistic texture variations.
+
+    Args:
+        gravel_roi (tuple[float, float, float, float]): Region of interest where gravel
+            will be added, specified as (x_min, y_min, x_max, y_max) in relative coordinates
+            [0, 1]. Default: (0.1, 0.4, 0.9, 0.9).
+        number_of_patches (int): Number of gravel patch regions to generate within the ROI.
+            Each patch will contain multiple gravel particles. Default: 2.
+        p (float): Probability of applying the transform. Default: 0.5.
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Number of channels:
+        3
+
+    Note:
+        - The gravel effect is created by modifying the saturation channel in the HLS color space.
+        - Gravel particles are distributed within randomly generated patches inside the specified ROI.
+        - This transform is particularly useful for:
+          * Augmenting datasets for road condition analysis
+          * Simulating variations in terrain for computer vision tasks
+          * Adding realistic texture to synthetic images of outdoor scenes
+
+    Mathematical Formulation:
+        For each gravel patch:
+        1. A rectangular region is randomly generated within the specified ROI.
+        2. Within this region, multiple gravel particles are placed.
+        3. For each particle:
+           - Random (x, y) coordinates are generated within the patch.
+           - A random radius (r) between 1 and 3 pixels is assigned.
+           - A random saturation value (sat) between 0 and 255 is assigned.
+        4. The saturation channel of the image is modified for each particle:
+           image_hls[y-r:y+r, x-r:x+r, 1] = sat
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+
+        # Default usage
+        >>> transform = A.RandomGravel(p=1.0)
+        >>> augmented_image = transform(image=image)["image"]
+
+        # Custom ROI and number of patches
+        >>> transform = A.RandomGravel(
+        ...     gravel_roi=(0.2, 0.2, 0.8, 0.8),
+        ...     number_of_patches=5,
+        ...     p=1.0
+        ... )
+        >>> augmented_image = transform(image=image)["image"]
+
+        # Combining with other transforms
+        >>> transform = A.Compose([
+        ...     A.RandomGravel(p=0.7),
+        ...     A.RandomBrightnessContrast(p=0.5),
+        ... ])
+        >>> augmented_image = transform(image=image)["image"]
+
+    References:
+        - Road surface textures: https://en.wikipedia.org/wiki/Road_surface
+        - HLS color space: https://en.wikipedia.org/wiki/HSL_and_HSV
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        gravel_roi: tuple[float, float, float, float]
+        number_of_patches: int = Field(ge=1)
+
+        @model_validator(mode="after")
+        def validate_gravel_roi(self) -> Self:
+            gravel_lower_x, gravel_lower_y, gravel_upper_x, gravel_upper_y = self.gravel_roi
+            if not 0 <= gravel_lower_x < gravel_upper_x <= 1 or not 0 <= gravel_lower_y < gravel_upper_y <= 1:
+                raise ValueError(f"Invalid gravel_roi. Got: {self.gravel_roi}.")
+            return self
+
+    def __init__(
+        self,
+        gravel_roi: tuple[float, float, float, float] = (0.1, 0.4, 0.9, 0.9),
+        number_of_patches: int = 2,
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p, always_apply)
+        self.gravel_roi = gravel_roi
+        self.number_of_patches = number_of_patches
+
+    def generate_gravel_patch(self, rectangular_roi: tuple[int, int, int, int]) -> np.ndarray:
+        x_min, y_min, x_max, y_max = rectangular_roi
+        area = abs((x_max - x_min) * (y_max - y_min))
+        count = area // 10
+        gravels = np.empty([count, 2], dtype=np.int64)
+        gravels[:, 0] = random_utils.randint(x_min, x_max, count)
+        gravels[:, 1] = random_utils.randint(y_min, y_max, count)
+        return gravels
+
+    def apply(self, img: np.ndarray, gravels_infos: list[Any], **params: Any) -> np.ndarray:
+        return fmain.add_gravel(img, gravels_infos)
+
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, np.ndarray]:
+        height, width = params["shape"][:2]
+
+        # Calculate ROI in pixels
+        x_min, y_min, x_max, y_max = (
+            int(coord * dim) for coord, dim in zip(self.gravel_roi, [width, height, width, height])
+        )
+
+        roi_width = x_max - x_min
+        roi_height = y_max - y_min
+
+        gravels_info = []
+
+        for _ in range(self.number_of_patches):
+            # Generate a random rectangular region within the ROI
+            patch_width = random.randint(roi_width // 10, roi_width // 5)
+            patch_height = random.randint(roi_height // 10, roi_height // 5)
+
+            patch_x = random.randint(x_min, x_max - patch_width)
+            patch_y = random.randint(y_min, y_max - patch_height)
+
+            # Generate gravel particles within this patch
+            num_particles = (patch_width * patch_height) // 100  # Adjust this divisor to control density
+
+            for _ in range(num_particles):
+                x = random.randint(patch_x, patch_x + patch_width)
+                y = random.randint(patch_y, patch_y + patch_height)
+                r = random.randint(1, 3)
+                sat = random.randint(0, 255)
+
+                gravels_info.append(
+                    [
+                        max(y - r, 0),  # min_y
+                        min(y + r, height - 1),  # max_y
+                        max(x - r, 0),  # min_x
+                        min(x + r, width - 1),  # max_x
+                        sat,  # saturation
+                    ],
+                )
+
+        return {"gravels_infos": np.array(gravels_info, dtype=np.int64)}
+
+    def get_transform_init_args_names(self) -> tuple[str, str]:
+        return "gravel_roi", "number_of_patches"
+
+
+class RandomRain(ImageOnlyTransform):
+    """Adds rain effects to an image.
+
+    This transform simulates rainfall by overlaying semi-transparent streaks onto the image,
+    creating a realistic rain effect. It can be used to augment datasets for computer vision
+    tasks that need to perform well in rainy conditions.
+
+    Args:
+        slant_range (tuple[int, int]): Range for the rain slant angle in degrees.
+            Negative values slant to the left, positive to the right. Default: (-10, 10).
+        drop_length (int): Length of the rain drops in pixels. Default: 20.
+        drop_width (int): Width of the rain drops in pixels. Default: 1.
+        drop_color (tuple[int, int, int]): Color of the rain drops in RGB format. Default: (200, 200, 200).
+        blur_value (int): Blur value for simulating rain effect. Rainy views are typically blurry. Default: 7.
+        brightness_coefficient (float): Coefficient to adjust the brightness of the image.
+            Rainy scenes are usually darker. Should be in the range (0, 1]. Default: 0.7.
+        rain_type (Literal["drizzle", "heavy", "torrential", "default"]): Type of rain to simulate.
+        p (float): Probability of applying the transform. Default: 0.5.
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Number of channels:
+        3
+
+    Note:
+        - The rain effect is created by drawing semi-transparent lines on the image.
+        - The slant of the rain can be controlled to simulate wind effects.
+        - Different rain types (drizzle, heavy, torrential) adjust the density and appearance of the rain.
+        - The transform also adjusts image brightness and applies a blur to simulate the visual effects of rain.
+        - This transform is particularly useful for:
+          * Augmenting datasets for autonomous driving in rainy conditions
+          * Testing the robustness of computer vision models to weather effects
+          * Creating realistic rainy scenes for image editing or film production
+
+    Mathematical Formulation:
+        For each raindrop:
+        1. Start position (x1, y1) is randomly generated within the image.
+        2. End position (x2, y2) is calculated based on drop_length and slant:
+           x2 = x1 + drop_length * sin(slant)
+           y2 = y1 + drop_length * cos(slant)
+        3. A line is drawn from (x1, y1) to (x2, y2) with the specified drop_color and drop_width.
+        4. The image is then blurred and its brightness is adjusted.
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+
+        # Default usage
+        >>> transform = A.RandomRain(p=1.0)
+        >>> rainy_image = transform(image=image)["image"]
+
+        # Custom rain parameters
+        >>> transform = A.RandomRain(
+        ...     slant_range=(-15, 15),
+        ...     drop_length=30,
+        ...     drop_width=2,
+        ...     drop_color=(180, 180, 180),
+        ...     blur_value=5,
+        ...     brightness_coefficient=0.8,
+        ...     p=1.0
+        ... )
+        >>> rainy_image = transform(image=image)["image"]
+
+        # Simulating heavy rain
+        >>> transform = A.RandomRain(rain_type="heavy", p=1.0)
+        >>> heavy_rain_image = transform(image=image)["image"]
+
+    References:
+        - Rain visualization techniques: https://developer.nvidia.com/gpugems/gpugems3/part-iv-image-effects/chapter-27-real-time-rain-rendering
+        - Weather effects in computer vision: https://www.sciencedirect.com/science/article/pii/S1077314220300692
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        slant_lower: int | None = Field(default=None)
+        slant_upper: int | None = Field(default=None)
+        slant_range: Annotated[tuple[float, float], AfterValidator(nondecreasing)]
+        drop_length: int = Field(ge=1)
+        drop_width: int = Field(ge=1)
+        drop_color: tuple[int, int, int]
+        blur_value: int = Field(ge=1)
+        brightness_coefficient: float = Field(gt=0, le=1)
+        rain_type: RainMode
+
+        @model_validator(mode="after")
+        def validate_ranges(self) -> Self:
+            if self.slant_lower is not None or self.slant_upper is not None:
+                if self.slant_lower is not None:
+                    warn(
+                        "`slant_lower` deprecated. Use `slant_range` as tuple (slant_lower, slant_upper) instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                if self.slant_upper is not None:
+                    warn(
+                        "`slant_upper` deprecated. Use `slant_range` as tuple (slant_lower, slant_upper) instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                lower = self.slant_lower if self.slant_lower is not None else self.slant_range[0]
+                upper = self.slant_upper if self.slant_upper is not None else self.slant_range[1]
+                self.slant_range = (lower, upper)
+                self.slant_lower = None
+                self.slant_upper = None
+
+            # Validate the slant_range
+            if not (-MAX_RAIN_ANGLE <= self.slant_range[0] <= self.slant_range[1] <= MAX_RAIN_ANGLE):
+                raise ValueError(
+                    f"slant_range values should be increasing within [-{MAX_RAIN_ANGLE}, {MAX_RAIN_ANGLE}] range.",
+                )
+            return self
+
+    def __init__(
+        self,
+        slant_lower: int | None = None,
+        slant_upper: int | None = None,
+        slant_range: tuple[int, int] = (-10, 10),
+        drop_length: int = 20,
+        drop_width: int = 1,
+        drop_color: tuple[int, int, int] = (200, 200, 200),
+        blur_value: int = 7,
+        brightness_coefficient: float = 0.7,
+        rain_type: RainMode = "default",
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.slant_range = slant_range
         self.drop_length = drop_length
         self.drop_width = drop_width
         self.drop_color = drop_color
@@ -1757,9 +900,18 @@ class RandomRain(ImageOnlyTransform):
         self.brightness_coefficient = brightness_coefficient
         self.rain_type = rain_type
 
-    def apply(self, image, slant=10, drop_length=20, rain_drops=[], **params):
-        return F.add_rain(
-            image,
+    def apply(
+        self,
+        img: np.ndarray,
+        slant: int,
+        drop_length: int,
+        rain_drops: list[tuple[int, int]],
+        **params: Any,
+    ) -> np.ndarray:
+        non_rgb_error(img)
+
+        return fmain.add_rain(
+            img,
             slant,
             drop_length,
             self.drop_width,
@@ -1769,15 +921,10 @@ class RandomRain(ImageOnlyTransform):
             rain_drops,
         )
 
-    @property
-    def targets_as_params(self):
-        return ["image"]
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        slant = int(random.uniform(*self.slant_range))
 
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-        slant = int(random.uniform(self.slant_lower, self.slant_upper))
-
-        height, width = img.shape[:2]
+        height, width = params["shape"][:2]
         area = height * width
 
         if self.rain_type == "drizzle":
@@ -1795,22 +942,17 @@ class RandomRain(ImageOnlyTransform):
 
         rain_drops = []
 
-        for _i in range(num_drops):  # If You want heavy rain, try increasing this
-            if slant < 0:
-                x = random.randint(slant, width)
-            else:
-                x = random.randint(0, width - slant)
-
-            y = random.randint(0, height - drop_length)
+        for _ in range(num_drops):  # If You want heavy rain, try increasing this
+            x = random.randint(slant, width) if slant < 0 else random.randint(0, max(width - slant, 0))
+            y = random.randint(0, max(height - drop_length, 0))
 
             rain_drops.append((x, y))
 
-        return {"drop_length": drop_length, "rain_drops": rain_drops}
+        return {"drop_length": drop_length, "slant": slant, "rain_drops": rain_drops}
 
-    def get_transform_init_args_names(self):
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
         return (
-            "slant_lower",
-            "slant_upper",
+            "slant_range",
             "drop_length",
             "drop_width",
             "drop_color",
@@ -1821,246 +963,650 @@ class RandomRain(ImageOnlyTransform):
 
 
 class RandomFog(ImageOnlyTransform):
-    """Simulates fog for the image
+    """Simulates fog for the image by adding random fog-like artifacts.
 
-    From https://github.com/UjjwalSaxena/Automold--Road-Augmentation-Library
+    This transform creates a fog effect by generating semi-transparent overlays
+    that mimic the visual characteristics of fog. The fog intensity and distribution
+    can be controlled to create various fog-like conditions.
 
     Args:
-        fog_coef_lower (float): lower limit for fog intensity coefficient. Should be in [0, 1] range.
-        fog_coef_upper (float): upper limit for fog intensity coefficient. Should be in [0, 1] range.
-        alpha_coef (float): transparency of the fog circles. Should be in [0, 1] range.
+        fog_coef_range (tuple[float, float]): Range for fog intensity coefficient. Should be in [0, 1] range.
+        alpha_coef (float): Transparency of the fog circles. Should be in [0, 1] range. Default: 0.08.
+        p (float): Probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - The fog effect is created by overlaying semi-transparent circles on the image.
+        - Higher fog coefficient values result in denser fog effects.
+        - The fog is typically denser in the center of the image and gradually decreases towards the edges.
+        - This transform is useful for:
+          * Simulating various weather conditions in outdoor scenes
+          * Data augmentation for improving model robustness to foggy conditions
+          * Creating atmospheric effects in image editing
+
+    Mathematical Formulation:
+        For each fog particle:
+        1. A position (x, y) is randomly generated within the image.
+        2. A circle with random radius is drawn at this position.
+        3. The circle's alpha (transparency) is determined by the alpha_coef.
+        4. These circles are overlaid on the original image to create the fog effect.
+
+        The final pixel value is calculated as:
+        output = (1 - alpha) * original_pixel + alpha * fog_color
+
+        where alpha is influenced by the fog_coef and alpha_coef parameters.
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+
+        # Default usage
+        >>> transform = A.RandomFog(p=1.0)
+        >>> foggy_image = transform(image=image)["image"]
+
+        # Custom fog intensity range
+        >>> transform = A.RandomFog(fog_coef_lower=0.3, fog_coef_upper=0.8, p=1.0)
+        >>> foggy_image = transform(image=image)["image"]
+
+        # Adjust fog transparency
+        >>> transform = A.RandomFog(fog_coef_lower=0.2, fog_coef_upper=0.5, alpha_coef=0.1, p=1.0)
+        >>> foggy_image = transform(image=image)["image"]
+
+    References:
+        - Fog: https://en.wikipedia.org/wiki/Fog
+        - Atmospheric perspective: https://en.wikipedia.org/wiki/Aerial_perspective
     """
 
-    def __init__(self, fog_coef_lower=0.3, fog_coef_upper=1, alpha_coef=0.08, always_apply=False, p=0.5):
-        super(RandomFog, self).__init__(always_apply, p)
+    class InitSchema(BaseTransformInitSchema):
+        fog_coef_lower: float | None = Field(
+            ge=0,
+            le=1,
+        )
+        fog_coef_upper: float | None = Field(
+            ge=0,
+            le=1,
+        )
+        fog_coef_range: Annotated[tuple[float, float], AfterValidator(check_01), AfterValidator(nondecreasing)]
 
-        assert 0 <= fog_coef_lower <= fog_coef_upper <= 1
-        assert 0 <= alpha_coef <= 1
+        alpha_coef: float = Field(ge=0, le=1)
 
-        self.fog_coef_lower = fog_coef_lower
-        self.fog_coef_upper = fog_coef_upper
-        self.alpha_coef = alpha_coef
+        @model_validator(mode="after")
+        def validate_fog_coefficients(self) -> Self:
+            if self.fog_coef_lower is not None:
+                warn("`fog_coef_lower` is deprecated, use `fog_coef_range` instead.", DeprecationWarning, stacklevel=2)
+            if self.fog_coef_upper is not None:
+                warn("`fog_coef_upper` is deprecated, use `fog_coef_range` instead.", DeprecationWarning, stacklevel=2)
 
-    def apply(self, image, fog_coef=0.1, haze_list=[], **params):
-        return F.add_fog(image, fog_coef, self.alpha_coef, haze_list)
+            lower = self.fog_coef_lower if self.fog_coef_lower is not None else self.fog_coef_range[0]
+            upper = self.fog_coef_upper if self.fog_coef_upper is not None else self.fog_coef_range[1]
+            self.fog_coef_range = (lower, upper)
 
-    @property
-    def targets_as_params(self):
-        return ["image"]
+            self.fog_coef_lower = None
+            self.fog_coef_upper = None
 
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-        fog_coef = random.uniform(self.fog_coef_lower, self.fog_coef_upper)
-
-        height, width = imshape = img.shape[:2]
-
-        hw = max(1, int(width // 3 * fog_coef))
-
-        haze_list = []
-        midx = width // 2 - 2 * hw
-        midy = height // 2 - hw
-        index = 1
-
-        while midx > -hw or midy > -hw:
-            for _i in range(hw // 10 * index):
-                x = random.randint(midx, width - midx - hw)
-                y = random.randint(midy, height - midy - hw)
-                haze_list.append((x, y))
-
-            midx -= 3 * hw * width // sum(imshape)
-            midy -= 3 * hw * height // sum(imshape)
-            index += 1
-
-        return {"haze_list": haze_list, "fog_coef": fog_coef}
-
-    def get_transform_init_args_names(self):
-        return ("fog_coef_lower", "fog_coef_upper", "alpha_coef")
-
-
-class RandomSunFlare(ImageOnlyTransform):
-    """Simulates Sun Flare for the image
-
-    From https://github.com/UjjwalSaxena/Automold--Road-Augmentation-Library
-
-    Args:
-        flare_roi (float, float, float, float): region of the image where flare will
-            appear (x_min, y_min, x_max, y_max). All values should be in range [0, 1].
-        angle_lower (float): should be in range [0, `angle_upper`].
-        angle_upper (float): should be in range [`angle_lower`, 1].
-        num_flare_circles_lower (int): lower limit for the number of flare circles.
-            Should be in range [0, `num_flare_circles_upper`].
-        num_flare_circles_upper (int): upper limit for the number of flare circles.
-            Should be in range [`num_flare_circles_lower`, inf].
-        src_radius (int):
-        src_color ((int, int, int)): color of the flare
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-    """
+            return self
 
     def __init__(
         self,
-        flare_roi=(0, 0, 1, 0.5),
-        angle_lower=0,
-        angle_upper=1,
-        num_flare_circles_lower=6,
-        num_flare_circles_upper=10,
-        src_radius=400,
-        src_color=(255, 255, 255),
-        always_apply=False,
-        p=0.5,
+        fog_coef_lower: float | None = None,
+        fog_coef_upper: float | None = None,
+        alpha_coef: float = 0.08,
+        fog_coef_range: tuple[float, float] = (0.3, 1),
+        always_apply: bool | None = None,
+        p: float = 0.5,
     ):
-        super(RandomSunFlare, self).__init__(always_apply, p)
+        super().__init__(p=p, always_apply=always_apply)
+        self.fog_coef_range = fog_coef_range
+        self.alpha_coef = alpha_coef
 
-        (flare_center_lower_x, flare_center_lower_y, flare_center_upper_x, flare_center_upper_y) = flare_roi
+    def apply(
+        self,
+        img: np.ndarray,
+        particle_positions: np.ndarray,
+        intensity: float,
+        random_seed: int,
+        **params: Any,
+    ) -> np.ndarray:
+        return fmain.add_fog(img, intensity, self.alpha_coef, particle_positions, np.random.RandomState(random_seed))
 
-        assert 0 <= flare_center_lower_x < flare_center_upper_x <= 1
-        assert 0 <= flare_center_lower_y < flare_center_upper_y <= 1
-        assert 0 <= angle_lower < angle_upper <= 1
-        assert 0 <= num_flare_circles_lower < num_flare_circles_upper
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        # Select a random fog intensity within the specified range
+        intensity = random.uniform(*self.fog_coef_range)
 
-        self.flare_center_lower_x = flare_center_lower_x
-        self.flare_center_upper_x = flare_center_upper_x
+        image_shape = params["shape"][:2]
 
-        self.flare_center_lower_y = flare_center_lower_y
-        self.flare_center_upper_y = flare_center_upper_y
+        image_height, image_width = image_shape
 
-        self.angle_lower = angle_lower
-        self.angle_upper = angle_upper
-        self.num_flare_circles_lower = num_flare_circles_lower
-        self.num_flare_circles_upper = num_flare_circles_upper
+        # Calculate the size of the fog effect region based on image width and fog intensity
+        fog_region_size = max(1, int(image_width // 3 * intensity))
+
+        particle_positions = []
+
+        # Initialize the central region where fog will be most dense
+        center_x, center_y = (int(x) for x in fmain.center(image_shape))
+
+        # Define the initial size of the foggy area
+        current_width = image_width
+        current_height = image_height
+
+        # Define shrink factor for reducing the foggy area each iteration
+        shrink_factor = 0.1
+
+        max_iterations = 10  # Prevent infinite loop
+        iteration = 0
+
+        while current_width > fog_region_size and current_height > fog_region_size and iteration < max_iterations:
+            # Calculate the number of particles for this region
+            area = current_width * current_height
+            particles_in_region = int(area / (fog_region_size * fog_region_size) * intensity * 10)
+
+            for _ in range(particles_in_region):
+                # Generate random positions within the current region
+                x = random.randint(center_x - current_width // 2, center_x + current_width // 2)
+                y = random.randint(center_y - current_height // 2, center_y + current_height // 2)
+                particle_positions.append((x, y))
+
+            # Shrink the region for the next iteration
+            current_width = int(current_width * (1 - shrink_factor))
+            current_height = int(current_height * (1 - shrink_factor))
+
+            iteration += 1
+
+        return {
+            "particle_positions": particle_positions,
+            "intensity": intensity,
+            "random_seed": random_utils.get_random_seed(),
+        }
+
+    def get_transform_init_args_names(self) -> tuple[str, str]:
+        return "fog_coef_range", "alpha_coef"
+
+
+class RandomSunFlare(ImageOnlyTransform):
+    """Simulates a sun flare effect on the image by adding circles of light.
+
+    This transform creates a sun flare effect by overlaying multiple semi-transparent
+    circles of varying sizes and intensities along a line originating from a "sun" point.
+    It offers two methods: a simple overlay technique and a more complex physics-based approach.
+
+    Args:
+        flare_roi (tuple[float, float, float, float]): Region of interest where the sun flare
+            can appear. Values are in the range [0, 1] and represent (x_min, y_min, x_max, y_max)
+            in relative coordinates. Default: (0, 0, 1, 0.5).
+        angle_range (tuple[float, float]): Range of angles (in radians) for the flare direction.
+            Values should be in the range [0, 1], where 0 represents 0 radians and 1 represents 2π radians.
+            Default: (0, 1).
+        num_flare_circles_range (tuple[int, int]): Range for the number of flare circles to generate.
+            Default: (6, 10).
+        src_radius (int): Radius of the sun circle in pixels. Default: 400.
+        src_color (tuple[int, int, int]): Color of the sun in RGB format. Default: (255, 255, 255).
+        method (Literal["overlay", "physics_based"]): Method to use for generating the sun flare.
+            "overlay" uses a simple alpha blending technique, while "physics_based" simulates
+            more realistic optical phenomena. Default: "physics_based".
+
+        p (float): Probability of applying the transform. Default: 0.5.
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Number of channels:
+        - overlay: Any
+        - physics_based: RGB
+
+    Note:
+        The transform offers two methods for generating sun flares:
+
+        1. Overlay Method ("overlay"):
+           - Creates a simple sun flare effect using basic alpha blending.
+           - Steps:
+             a. Generate the main sun circle with a radial gradient.
+             b. Create smaller flare circles along the flare line.
+             c. Blend these elements with the original image using alpha compositing.
+           - Characteristics:
+             * Faster computation
+             * Less realistic appearance
+             * Suitable for basic augmentation or when performance is a priority
+
+        2. Physics-based Method ("physics_based"):
+           - Simulates more realistic optical phenomena observed in actual lens flares.
+           - Steps:
+             a. Create a separate flare layer for complex manipulations.
+             b. Add the main sun circle and diffraction spikes to simulate light diffraction.
+             c. Generate and add multiple flare circles with varying properties.
+             d. Apply Gaussian blur to create a soft, glowing effect.
+             e. Create and apply a radial gradient mask for natural fading from the center.
+             f. Simulate chromatic aberration by applying different blurs to color channels.
+             g. Blend the flare with the original image using screen blending mode.
+           - Characteristics:
+             * More computationally intensive
+             * Produces more realistic and visually appealing results
+             * Includes effects like diffraction spikes and chromatic aberration
+             * Suitable for high-quality augmentation or realistic image synthesis
+
+    Mathematical Formulation:
+        For both methods:
+        1. Sun position (x_s, y_s) is randomly chosen within the specified ROI.
+        2. Flare angle θ is randomly chosen from the angle_range.
+        3. For each flare circle i:
+           - Position (x_i, y_i) = (x_s + t_i * cos(θ), y_s + t_i * sin(θ))
+             where t_i is a random distance along the flare line.
+           - Radius r_i is randomly chosen, with larger circles closer to the sun.
+           - Alpha (transparency) alpha_i is randomly chosen in the range [0.05, 0.2].
+           - Color (R_i, G_i, B_i) is randomly chosen close to src_color.
+
+        Overlay method blending:
+        new_pixel = (1 - alpha_i) * original_pixel + alpha_i * flare_color_i
+
+        Physics-based method blending:
+        new_pixel = 255 - ((255 - original_pixel) * (255 - flare_pixel) / 255)
+
+        4. Each flare circle is blended with the image using alpha compositing:
+           new_pixel = (1 - alpha_i) * original_pixel + alpha_i * flare_color_i
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [1000, 1000, 3], dtype=np.uint8)
+
+        # Default sun flare (overlay method)
+        >>> transform = A.RandomSunFlare(p=1.0)
+        >>> flared_image = transform(image=image)["image"]
+
+        # Physics-based sun flare with custom parameters
+
+        # Default sun flare
+        >>> transform = A.RandomSunFlare(p=1.0)
+        >>> flared_image = transform(image=image)["image"]
+
+        # Custom sun flare parameters
+
+        >>> transform = A.RandomSunFlare(
+        ...     flare_roi=(0.1, 0, 0.9, 0.3),
+        ...     angle_range=(0.25, 0.75),
+        ...     num_flare_circles_range=(5, 15),
+        ...     src_radius=200,
+        ...     src_color=(255, 200, 100),
+        ...     method="physics_based",
+        ...     p=1.0
+        ... )
+        >>> flared_image = transform(image=image)["image"]
+
+    References:
+        - Lens flare: https://en.wikipedia.org/wiki/Lens_flare
+        - Alpha compositing: https://en.wikipedia.org/wiki/Alpha_compositing
+        - Diffraction: https://en.wikipedia.org/wiki/Diffraction
+        - Chromatic aberration: https://en.wikipedia.org/wiki/Chromatic_aberration
+        - Screen blending: https://en.wikipedia.org/wiki/Blend_modes#Screen
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        flare_roi: tuple[float, float, float, float]
+        angle_lower: float | None = Field(ge=0, le=1)
+        angle_upper: float | None = Field(ge=0, le=1)
+
+        num_flare_circles_lower: int | None = Field(
+            ge=0,
+        )
+        num_flare_circles_upper: int | None = Field(
+            gt=0,
+        )
+        src_radius: int = Field(gt=1)
+        src_color: tuple[int, ...]
+
+        angle_range: Annotated[tuple[float, float], AfterValidator(check_01), AfterValidator(nondecreasing)]
+
+        num_flare_circles_range: Annotated[
+            tuple[int, int],
+            AfterValidator(check_1plus),
+            AfterValidator(nondecreasing),
+        ]
+        method: Literal["overlay", "physics_based"]
+
+        @model_validator(mode="after")
+        def validate_parameters(self) -> Self:
+            flare_center_lower_x, flare_center_lower_y, flare_center_upper_x, flare_center_upper_y = self.flare_roi
+            if (
+                not 0 <= flare_center_lower_x < flare_center_upper_x <= 1
+                or not 0 <= flare_center_lower_y < flare_center_upper_y <= 1
+            ):
+                raise ValueError(f"Invalid flare_roi. Got: {self.flare_roi}")
+
+            if self.angle_lower is not None or self.angle_upper is not None:
+                if self.angle_lower is not None:
+                    warn(
+                        "`angle_lower` deprecated. Use `angle_range` as tuple (angle_lower, angle_upper) instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                if self.angle_upper is not None:
+                    warn(
+                        "`angle_upper` deprecated. Use `angle_range` as tuple(angle_lower, angle_upper) instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                lower = self.angle_lower if self.angle_lower is not None else self.angle_range[0]
+                upper = self.angle_upper if self.angle_upper is not None else self.angle_range[1]
+                self.angle_range = (lower, upper)
+
+            if self.num_flare_circles_lower is not None or self.num_flare_circles_upper is not None:
+                if self.num_flare_circles_lower is not None:
+                    warn(
+                        "`num_flare_circles_lower` deprecated. Use `num_flare_circles_range` as tuple"
+                        " (num_flare_circles_lower, num_flare_circles_upper) instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                if self.num_flare_circles_upper is not None:
+                    warn(
+                        "`num_flare_circles_upper` deprecated. Use `num_flare_circles_range` as tuple"
+                        " (num_flare_circles_lower, num_flare_circles_upper) instead.",
+                        DeprecationWarning,
+                        stacklevel=2,
+                    )
+                lower = (
+                    self.num_flare_circles_lower
+                    if self.num_flare_circles_lower is not None
+                    else self.num_flare_circles_range[0]
+                )
+                upper = (
+                    self.num_flare_circles_upper
+                    if self.num_flare_circles_upper is not None
+                    else self.num_flare_circles_range[1]
+                )
+                self.num_flare_circles_range = (lower, upper)
+
+            return self
+
+    def __init__(
+        self,
+        flare_roi: tuple[float, float, float, float] = (0, 0, 1, 0.5),
+        angle_lower: float | None = None,
+        angle_upper: float | None = None,
+        num_flare_circles_lower: int | None = None,
+        num_flare_circles_upper: int | None = None,
+        src_radius: int = 400,
+        src_color: tuple[int, ...] = (255, 255, 255),
+        angle_range: tuple[float, float] = (0, 1),
+        num_flare_circles_range: tuple[int, int] = (6, 10),
+        method: Literal["overlay", "physics_based"] = "overlay",
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+
+        self.angle_range = angle_range
+        self.num_flare_circles_range = num_flare_circles_range
 
         self.src_radius = src_radius
         self.src_color = src_color
+        self.flare_roi = flare_roi
+        self.method = method
 
-    def apply(self, image, flare_center_x=0.5, flare_center_y=0.5, circles=[], **params):
+    def apply(
+        self,
+        img: np.ndarray,
+        flare_center: tuple[float, float],
+        circles: list[Any],
+        **params: Any,
+    ) -> np.ndarray:
+        if self.method == "overlay":
+            return fmain.add_sun_flare_overlay(
+                img,
+                flare_center,
+                self.src_radius,
+                self.src_color,
+                circles,
+            )
+        if self.method == "physics_based":
+            non_rgb_error(img)
+            return fmain.add_sun_flare_physics_based(
+                img,
+                flare_center,
+                self.src_radius,
+                self.src_color,
+                circles,
+            )
 
-        return F.add_sun_flare(image, flare_center_x, flare_center_y, self.src_radius, self.src_color, circles)
+        raise ValueError(f"Invalid method: {self.method}")
 
-    @property
-    def targets_as_params(self):
-        return ["image"]
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        height, width = params["shape"][:2]
+        diagonal = math.sqrt(height**2 + width**2)
 
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-        height, width = img.shape[:2]
+        angle = 2 * math.pi * random.uniform(*self.angle_range)
 
-        angle = 2 * math.pi * random.uniform(self.angle_lower, self.angle_upper)
+        # Calculate flare center in pixel coordinates
+        x_min, y_min, x_max, y_max = self.flare_roi
+        flare_center_x = int(width * random.uniform(x_min, x_max))
+        flare_center_y = int(height * random.uniform(y_min, y_max))
 
-        flare_center_x = random.uniform(self.flare_center_lower_x, self.flare_center_upper_x)
-        flare_center_y = random.uniform(self.flare_center_lower_y, self.flare_center_upper_y)
+        num_circles = random.randint(*self.num_flare_circles_range)
 
-        flare_center_x = int(width * flare_center_x)
-        flare_center_y = int(height * flare_center_y)
+        # Calculate parameters relative to image size
+        step_size = max(1, int(diagonal * 0.01))  # 1% of diagonal, minimum 1 pixel
+        max_radius = max(2, int(height * 0.01))  # 1% of height, minimum 2 pixels
+        color_range = int(max(self.src_color) * 0.2)  # 20% of max color value
 
-        num_circles = random.randint(self.num_flare_circles_lower, self.num_flare_circles_upper)
+        def line(t: float) -> tuple[float, float]:
+            return (flare_center_x + t * math.cos(angle), flare_center_y + t * math.sin(angle))
+
+        # Generate points along the flare line
+        t_range = range(-flare_center_x, width - flare_center_x, step_size)
+        points = [line(t) for t in t_range]
 
         circles = []
-
-        x = []
-        y = []
-
-        for rand_x in range(0, width, 10):
-            rand_y = math.tan(angle) * (rand_x - flare_center_x) + flare_center_y
-            x.append(rand_x)
-            y.append(2 * flare_center_y - rand_y)
-
-        for _i in range(num_circles):
+        for _ in range(num_circles):
             alpha = random.uniform(0.05, 0.2)
-            r = random.randint(0, len(x) - 1)
-            rad = random.randint(1, max(height // 100 - 2, 2))
+            point = random.choice(points)
+            rad = random.randint(1, max_radius)
 
-            r_color = random.randint(max(self.src_color[0] - 50, 0), self.src_color[0])
-            g_color = random.randint(max(self.src_color[0] - 50, 0), self.src_color[0])
-            b_color = random.randint(max(self.src_color[0] - 50, 0), self.src_color[0])
+            # Generate colors relative to src_color
+            colors = [random.randint(max(c - color_range, 0), c) for c in self.src_color]
 
-            circles += [(alpha, (int(x[r]), int(y[r])), pow(rad, 3), (r_color, g_color, b_color))]
+            circles.append(
+                (
+                    alpha,
+                    (int(point[0]), int(point[1])),
+                    pow(rad, 3),
+                    tuple(colors),
+                ),
+            )
 
-        return {"circles": circles, "flare_center_x": flare_center_x, "flare_center_y": flare_center_y}
-
-    def get_transform_init_args(self):
         return {
-            "flare_roi": (
-                self.flare_center_lower_x,
-                self.flare_center_lower_y,
-                self.flare_center_upper_x,
-                self.flare_center_upper_y,
-            ),
-            "angle_lower": self.angle_lower,
-            "angle_upper": self.angle_upper,
-            "num_flare_circles_lower": self.num_flare_circles_lower,
-            "num_flare_circles_upper": self.num_flare_circles_upper,
+            "circles": circles,
+            "flare_center": (flare_center_x, flare_center_y),
+        }
+
+    def get_transform_init_args(self) -> dict[str, Any]:
+        return {
+            "flare_roi": self.flare_roi,
+            "angle_range": self.angle_range,
+            "num_flare_circles_range": self.num_flare_circles_range,
             "src_radius": self.src_radius,
             "src_color": self.src_color,
         }
 
 
 class RandomShadow(ImageOnlyTransform):
-    """Simulates shadows for the image
+    """Simulates shadows for the image by reducing the brightness of the image in shadow regions.
 
-    From https://github.com/UjjwalSaxena/Automold--Road-Augmentation-Library
+    This transform adds realistic shadow effects to images, which can be useful for augmenting
+    datasets for outdoor scene analysis, autonomous driving, or any computer vision task where
+    shadows may be present.
 
     Args:
-        shadow_roi (float, float, float, float): region of the image where shadows
+        shadow_roi (tuple[float, float, float, float]): Region of the image where shadows
             will appear (x_min, y_min, x_max, y_max). All values should be in range [0, 1].
-        num_shadows_lower (int): Lower limit for the possible number of shadows.
-            Should be in range [0, `num_shadows_upper`].
-        num_shadows_upper (int): Lower limit for the possible number of shadows.
-            Should be in range [`num_shadows_lower`, inf].
-        shadow_dimension (int): number of edges in the shadow polygons
+            Default: (0, 0.5, 1, 1).
+        num_shadows_limit (tuple[int, int]): Lower and upper limits for the possible number of shadows.
+            Default: (1, 2).
+        shadow_dimension (int): Number of edges in the shadow polygons. Default: 5.
+        shadow_intensity_range (tuple[float, float]): Range for the shadow intensity.
+            Should be two float values between 0 and 1. Default: (0.5, 0.5).
+        p (float): Probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - Shadows are created by generating random polygons within the specified ROI and
+          reducing the brightness of the image in these areas.
+        - The number of shadows, their shapes, and intensities can be randomized for variety.
+        - This transform is particularly useful for:
+          * Augmenting datasets for outdoor scene understanding
+          * Improving robustness of object detection models to shadowed conditions
+          * Simulating different lighting conditions in synthetic datasets
+
+    Mathematical Formulation:
+        For each shadow:
+        1. A polygon with `shadow_dimension` vertices is generated within the shadow ROI.
+        2. The shadow intensity a is randomly chosen from `shadow_intensity_range`.
+        3. For each pixel (x, y) within the polygon:
+           new_pixel_value = original_pixel_value * (1 - a)
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+
+        # Default usage
+        >>> transform = A.RandomShadow(p=1.0)
+        >>> shadowed_image = transform(image=image)["image"]
+
+        # Custom shadow parameters
+        >>> transform = A.RandomShadow(
+        ...     shadow_roi=(0.2, 0.2, 0.8, 0.8),
+        ...     num_shadows_limit=(2, 4),
+        ...     shadow_dimension=8,
+        ...     shadow_intensity_range=(0.3, 0.7),
+        ...     p=1.0
+        ... )
+        >>> shadowed_image = transform(image=image)["image"]
+
+        # Combining with other transforms
+        >>> transform = A.Compose([
+        ...     A.RandomShadow(p=0.5),
+        ...     A.RandomBrightnessContrast(p=0.5),
+        ... ])
+        >>> augmented_image = transform(image=image)["image"]
+
+    References:
+        - Shadow detection and removal: https://www.sciencedirect.com/science/article/pii/S1047320315002035
+        - Shadows in computer vision: https://en.wikipedia.org/wiki/Shadow_detection
     """
+
+    class InitSchema(BaseTransformInitSchema):
+        shadow_roi: tuple[float, float, float, float]
+        num_shadows_limit: Annotated[tuple[int, int], AfterValidator(check_1plus), AfterValidator(nondecreasing)]
+        num_shadows_lower: int | None
+        num_shadows_upper: int | None
+        shadow_dimension: int = Field(ge=1)
+
+        shadow_intensity_range: Annotated[
+            tuple[float, float],
+            AfterValidator(check_01),
+            AfterValidator(nondecreasing),
+        ]
+
+        @model_validator(mode="after")
+        def validate_shadows(self) -> Self:
+            if self.num_shadows_lower is not None:
+                warn(
+                    "`num_shadows_lower` is deprecated. Use `num_shadows_limit` instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+
+            if self.num_shadows_upper is not None:
+                warn(
+                    "`num_shadows_upper` is deprecated. Use `num_shadows_limit` instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+
+            if self.num_shadows_lower is not None or self.num_shadows_upper is not None:
+                num_shadows_lower = (
+                    self.num_shadows_lower if self.num_shadows_lower is not None else self.num_shadows_limit[0]
+                )
+                num_shadows_upper = (
+                    self.num_shadows_upper if self.num_shadows_upper is not None else self.num_shadows_limit[1]
+                )
+
+                self.num_shadows_limit = (num_shadows_lower, num_shadows_upper)
+                self.num_shadows_lower = None
+                self.num_shadows_upper = None
+
+            shadow_lower_x, shadow_lower_y, shadow_upper_x, shadow_upper_y = self.shadow_roi
+
+            if not 0 <= shadow_lower_x <= shadow_upper_x <= 1 or not 0 <= shadow_lower_y <= shadow_upper_y <= 1:
+                raise ValueError(f"Invalid shadow_roi. Got: {self.shadow_roi}")
+
+            if isinstance(self.shadow_intensity_range, float):
+                if not (0 <= self.shadow_intensity_range <= 1):
+                    raise ValueError(
+                        f"shadow_intensity_range value should be within [0, 1] range. "
+                        f"Got: {self.shadow_intensity_range}",
+                    )
+            elif isinstance(self.shadow_intensity_range, tuple):
+                if not (0 <= self.shadow_intensity_range[0] <= self.shadow_intensity_range[1] <= 1):
+                    raise ValueError(
+                        f"shadow_intensity_range values should be within [0, 1] range and increasing. "
+                        f"Got: {self.shadow_intensity_range}",
+                    )
+            else:
+                raise TypeError("shadow_intensity_range should be an float or a tuple of floats.")
+
+            return self
 
     def __init__(
         self,
-        shadow_roi=(0, 0.5, 1, 1),
-        num_shadows_lower=1,
-        num_shadows_upper=2,
-        shadow_dimension=5,
-        always_apply=False,
-        p=0.5,
+        shadow_roi: tuple[float, float, float, float] = (0, 0.5, 1, 1),
+        num_shadows_limit: tuple[int, int] = (1, 2),
+        num_shadows_lower: int | None = None,
+        num_shadows_upper: int | None = None,
+        shadow_dimension: int = 5,
+        shadow_intensity_range: tuple[float, float] = (0.5, 0.5),
+        always_apply: bool | None = None,
+        p: float = 0.5,
     ):
-        super(RandomShadow, self).__init__(always_apply, p)
-
-        (shadow_lower_x, shadow_lower_y, shadow_upper_x, shadow_upper_y) = shadow_roi
-
-        assert 0 <= shadow_lower_x <= shadow_upper_x <= 1
-        assert 0 <= shadow_lower_y <= shadow_upper_y <= 1
-        assert 0 <= num_shadows_lower <= num_shadows_upper
+        super().__init__(p=p, always_apply=always_apply)
 
         self.shadow_roi = shadow_roi
-
-        self.num_shadows_lower = num_shadows_lower
-        self.num_shadows_upper = num_shadows_upper
-
         self.shadow_dimension = shadow_dimension
+        self.num_shadows_limit = num_shadows_limit
+        self.shadow_intensity_range = shadow_intensity_range
 
-    def apply(self, image, vertices_list=[], **params):
-        return F.add_shadow(image, vertices_list)
+    def apply(
+        self,
+        img: np.ndarray,
+        vertices_list: list[np.ndarray],
+        intensities: np.ndarray,
+        **params: Any,
+    ) -> np.ndarray:
+        return fmain.add_shadow(img, vertices_list, intensities)
 
-    @property
-    def targets_as_params(self):
-        return ["image"]
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, list[np.ndarray]]:
+        height, width = params["shape"][:2]
 
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-        height, width = img.shape[:2]
-
-        num_shadows = random.randint(self.num_shadows_lower, self.num_shadows_upper)
+        num_shadows = random.randint(self.num_shadows_limit[0], self.num_shadows_limit[1])
 
         x_min, y_min, x_max, y_max = self.shadow_roi
 
@@ -2069,687 +1615,1246 @@ class RandomShadow(ImageOnlyTransform):
         y_min = int(y_min * height)
         y_max = int(y_max * height)
 
-        vertices_list = []
+        vertices_list = [
+            np.stack(
+                [
+                    random_utils.randint(x_min, x_max, size=5),
+                    random_utils.randint(y_min, y_max, size=5),
+                ],
+                axis=1,
+            )
+            for _ in range(num_shadows)
+        ]
 
-        for _index in range(num_shadows):
-            vertex = []
-            for _dimension in range(self.shadow_dimension):
-                vertex.append((random.randint(x_min, x_max), random.randint(y_min, y_max)))
+        # Sample shadow intensity for each shadow
+        intensities = random_utils.uniform(
+            self.shadow_intensity_range[0],
+            self.shadow_intensity_range[1],
+            size=num_shadows,
+        )
 
-            vertices = np.array([vertex], dtype=np.int32)
-            vertices_list.append(vertices)
+        return {"vertices_list": vertices_list, "intensities": intensities}
 
-        return {"vertices_list": vertices_list}
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return (
+            "shadow_roi",
+            "num_shadows_limit",
+            "shadow_dimension",
+        )
 
-    def get_transform_init_args_names(self):
-        return ("shadow_roi", "num_shadows_lower", "num_shadows_upper", "shadow_dimension")
 
+class RandomToneCurve(ImageOnlyTransform):
+    """Randomly change the relationship between bright and dark areas of the image by manipulating its tone curve.
 
-class HueSaturationValue(ImageOnlyTransform):
-    """Randomly change hue, saturation and value of the input image.
+    This transform applies a random S-curve to the image's tone curve, adjusting the brightness and contrast
+    in a non-linear manner. It can be applied to the entire image or to each channel separately.
 
     Args:
-        hue_shift_limit ((int, int) or int): range for changing hue. If hue_shift_limit is a single int, the range
-            will be (-hue_shift_limit, hue_shift_limit). Default: (-20, 20).
-        sat_shift_limit ((int, int) or int): range for changing saturation. If sat_shift_limit is a single int,
-            the range will be (-sat_shift_limit, sat_shift_limit). Default: (-30, 30).
-        val_shift_limit ((int, int) or int): range for changing value. If val_shift_limit is a single int, the range
-            will be (-val_shift_limit, val_shift_limit). Default: (-20, 20).
-        p (float): probability of applying the transform. Default: 0.5.
+        scale (float): Standard deviation of the normal distribution used to sample random distances
+            to move two control points that modify the image's curve. Values should be in range [0, 1].
+            Higher values will result in more dramatic changes to the image. Default: 0.1
+        per_channel (bool): If True, the tone curve will be applied to each channel of the input image separately,
+            which can lead to color distortion. If False, the same curve is applied to all channels,
+            preserving the original color relationships. Default: False
+        p (float): Probability of applying the transform. Default: 0.5
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - This transform modifies the image's histogram by applying a smooth, S-shaped curve to it.
+        - The S-curve is defined by moving two control points of a quadratic Bézier curve.
+        - When per_channel is False, the same curve is applied to all channels, maintaining color balance.
+        - When per_channel is True, different curves are applied to each channel, which can create color shifts.
+        - This transform can be used to adjust image contrast and brightness in a more natural way than linear
+            transforms.
+        - The effect can range from subtle contrast adjustments to more dramatic "vintage" or "faded" looks.
+
+    Mathematical Formulation:
+        1. Two control points are randomly moved from their default positions (0.25, 0.25) and (0.75, 0.75).
+        2. The new positions are sampled from a normal distribution: N(μ, σ²), where μ is the original position
+        and alpha is the scale parameter.
+        3. These points, along with fixed points at (0, 0) and (1, 1), define a quadratic Bézier curve.
+        4. The curve is applied as a lookup table to the image intensities:
+           new_intensity = curve(original_intensity)
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+
+        # Apply a random tone curve to all channels together
+        >>> transform = A.RandomToneCurve(scale=0.1, per_channel=False, p=1.0)
+        >>> augmented_image = transform(image=image)['image']
+
+        # Apply random tone curves to each channel separately
+        >>> transform = A.RandomToneCurve(scale=0.2, per_channel=True, p=1.0)
+        >>> augmented_image = transform(image=image)['image']
+
+    References:
+        - "What Else Can Fool Deep Learning? Addressing Color Constancy Errors on Deep Neural Network Performance"
+          by Mahmoud Afifi and Michael S. Brown, ICCV 2019.
+        - Bézier curve: https://en.wikipedia.org/wiki/B%C3%A9zier_curve#Quadratic_B%C3%A9zier_curves
+        - Tone mapping: https://en.wikipedia.org/wiki/Tone_mapping
     """
 
-    def __init__(self, hue_shift_limit=20, sat_shift_limit=30, val_shift_limit=20, always_apply=False, p=0.5):
-        super(HueSaturationValue, self).__init__(always_apply, p)
-        self.hue_shift_limit = to_tuple(hue_shift_limit)
-        self.sat_shift_limit = to_tuple(sat_shift_limit)
-        self.val_shift_limit = to_tuple(val_shift_limit)
+    class InitSchema(BaseTransformInitSchema):
+        scale: float = Field(
+            ge=0,
+            le=1,
+        )
+        per_channel: bool
 
-    def apply(self, image, hue_shift=0, sat_shift=0, val_shift=0, **params):
-        return F.shift_hsv(image, hue_shift, sat_shift, val_shift)
+    def __init__(
+        self,
+        scale: float = 0.1,
+        per_channel: bool = False,
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.scale = scale
+        self.per_channel = per_channel
 
-    def get_params(self):
+    def apply(
+        self,
+        img: np.ndarray,
+        low_y: float | np.ndarray,
+        high_y: float | np.ndarray,
+        **params: Any,
+    ) -> np.ndarray:
+        return fmain.move_tone_curve(img, low_y, high_y)
+
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        image = data["image"] if "image" in data else data["images"][0]
+        num_channels = get_num_channels(image)
+
+        if self.per_channel and num_channels != 1:
+            return {
+                "low_y": np.clip(random_utils.normal(loc=0.25, scale=self.scale, size=(num_channels,)), 0, 1),
+                "high_y": np.clip(random_utils.normal(loc=0.75, scale=self.scale, size=(num_channels,)), 0, 1),
+            }
+        # Same values for all channels
+        low_y = np.clip(random_utils.normal(loc=0.25, scale=self.scale), 0, 1)
+        high_y = np.clip(random_utils.normal(loc=0.75, scale=self.scale), 0, 1)
+
+        return {"low_y": low_y, "high_y": high_y}
+
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return "scale", "per_channel"
+
+
+class HueSaturationValue(ImageOnlyTransform):
+    """Randomly change hue, saturation and value of the input image.
+
+    This transform adjusts the HSV (Hue, Saturation, Value) channels of an input RGB image.
+    It allows for independent control over each channel, providing a wide range of color
+    and brightness modifications.
+
+    Args:
+        hue_shift_limit (float | tuple[float, float]): Range for changing hue.
+            If a single float value is provided, the range will be (-hue_shift_limit, hue_shift_limit).
+            Values should be in the range [-180, 180]. Default: (-20, 20).
+
+        sat_shift_limit (float | tuple[float, float]): Range for changing saturation.
+            If a single float value is provided, the range will be (-sat_shift_limit, sat_shift_limit).
+            Values should be in the range [-255, 255]. Default: (-30, 30).
+
+        val_shift_limit (float | tuple[float, float]): Range for changing value (brightness).
+            If a single float value is provided, the range will be (-val_shift_limit, val_shift_limit).
+            Values should be in the range [-255, 255]. Default: (-20, 20).
+
+        p (float): Probability of applying the transform. Default: 0.5.
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Number of channels:
+        3
+
+    Note:
+        - The transform first converts the input RGB image to the HSV color space.
+        - Each channel (Hue, Saturation, Value) is adjusted independently.
+        - Hue is circular, so it wraps around at 180 degrees.
+        - For float32 images, the shift values are applied as percentages of the full range.
+        - This transform is particularly useful for color augmentation and simulating
+          different lighting conditions.
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>> transform = A.HueSaturationValue(
+        ...     hue_shift_limit=20,
+        ...     sat_shift_limit=30,
+        ...     val_shift_limit=20,
+        ...     p=0.7
+        ... )
+        >>> result = transform(image=image)
+        >>> augmented_image = result["image"]
+
+    References:
+        - HSV color space: https://en.wikipedia.org/wiki/HSL_and_HSV
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        hue_shift_limit: SymmetricRangeType
+        sat_shift_limit: SymmetricRangeType
+        val_shift_limit: SymmetricRangeType
+
+    def __init__(
+        self,
+        hue_shift_limit: ScaleFloatType = (-20, 20),
+        sat_shift_limit: ScaleFloatType = (-30, 30),
+        val_shift_limit: ScaleFloatType = (-20, 20),
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.hue_shift_limit = cast(Tuple[float, float], hue_shift_limit)
+        self.sat_shift_limit = cast(Tuple[float, float], sat_shift_limit)
+        self.val_shift_limit = cast(Tuple[float, float], val_shift_limit)
+
+    def apply(
+        self,
+        img: np.ndarray,
+        hue_shift: int,
+        sat_shift: int,
+        val_shift: int,
+        **params: Any,
+    ) -> np.ndarray:
+        if not is_rgb_image(img) and not is_grayscale_image(img):
+            msg = "HueSaturationValue transformation expects 1-channel or 3-channel images."
+            raise TypeError(msg)
+        return fmain.shift_hsv(img, hue_shift, sat_shift, val_shift)
+
+    def get_params(self) -> dict[str, float]:
         return {
-            "hue_shift": random.uniform(self.hue_shift_limit[0], self.hue_shift_limit[1]),
-            "sat_shift": random.uniform(self.sat_shift_limit[0], self.sat_shift_limit[1]),
-            "val_shift": random.uniform(self.val_shift_limit[0], self.val_shift_limit[1]),
+            "hue_shift": random.uniform(*self.hue_shift_limit),
+            "sat_shift": random.uniform(*self.sat_shift_limit),
+            "val_shift": random.uniform(*self.val_shift_limit),
         }
 
-    def get_transform_init_args_names(self):
-        return ("hue_shift_limit", "sat_shift_limit", "val_shift_limit")
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return "hue_shift_limit", "sat_shift_limit", "val_shift_limit"
 
 
 class Solarize(ImageOnlyTransform):
     """Invert all pixel values above a threshold.
 
     Args:
-        threshold ((int, int) or int, or (float, float) or float): range for solarizing threshold.
-        If threshold is a single value, the range will be [threshold, threshold]. Default: 128.
-        p (float): probability of applying the transform. Default: 0.5.
+        threshold: range for solarizing threshold.
+            If threshold is a single value, the range will be [1, threshold]. Default: 128.
+        p: probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
-        any
+        uint8, float32
+
     """
 
-    def __init__(self, threshold=128, always_apply=False, p=0.5):
-        super(Solarize, self).__init__(always_apply, p)
+    class InitSchema(BaseTransformInitSchema):
+        threshold: OnePlusFloatRangeType = (128, 128)
 
-        if isinstance(threshold, (int, float)):
-            self.threshold = to_tuple(threshold, low=threshold)
-        else:
-            self.threshold = to_tuple(threshold, low=0)
+    def __init__(self, threshold: ScaleIntType = (128, 128), p: float = 0.5, always_apply: bool | None = None):
+        super().__init__(p=p, always_apply=always_apply)
+        self.threshold = cast(Tuple[float, float], threshold)
 
-    def apply(self, image, threshold=0, **params):
-        return F.solarize(image, threshold)
+    def apply(self, img: np.ndarray, threshold: int, **params: Any) -> np.ndarray:
+        return fmain.solarize(img, threshold)
 
-    def get_params(self):
+    def get_params(self) -> dict[str, float]:
         return {"threshold": random.uniform(self.threshold[0], self.threshold[1])}
 
-    def get_transform_init_args_names(self):
+    def get_transform_init_args_names(self) -> tuple[str]:
         return ("threshold",)
 
 
 class Posterize(ImageOnlyTransform):
-    """Reduce the number of bits for each color channel.
+    """Reduces the number of bits for each color channel in the image.
+
+    This transform applies color posterization, a technique that reduces the number of distinct
+    colors used in an image. It works by lowering the number of bits used to represent each
+    color channel, effectively creating a "poster-like" effect with fewer color gradations.
 
     Args:
-        num_bits ((int, int) or int,
-                  or list of ints [r, g, b],
-                  or list of ints [[r1, r1], [g1, g2], [b1, b2]]): number of high bits.
-            If num_bits is a single value, the range will be [num_bits, num_bits].
-            Must be in range [0, 8]. Default: 4.
-        p (float): probability of applying the transform. Default: 0.5.
+        num_bits (int | tuple[int, int] | list[int] | list[tuple[int, int]]):
+            Defines the number of bits to keep for each color channel. Can be specified in several ways:
+            - Single int: Same number of bits for all channels. Range: [0, 8].
+            - Tuple of two ints: (min_bits, max_bits) to randomly choose from. Range for each: [0, 8].
+            - List of three ints: Specific number of bits for each channel [r_bits, g_bits, b_bits].
+            - List of three tuples: Ranges for each channel [(r_min, r_max), (g_min, g_max), (b_min, b_max)].
+            Default: 4
+
+        p (float): Probability of applying the transform. Default: 0.5.
 
     Targets:
-    image
+        image
 
     Image types:
-        uint8
+        uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - The effect becomes more pronounced as the number of bits is reduced.
+        - Using 0 bits for a channel will reduce it to a single color (usually black).
+        - Using 8 bits leaves the channel unchanged.
+        - This transform can create interesting artistic effects or be used for image compression simulation.
+        - Posterization is particularly useful for:
+          * Creating stylized or retro-looking images
+          * Reducing the color palette for specific artistic effects
+          * Simulating the look of older or lower-quality digital images
+          * Data augmentation in scenarios where color depth might vary
+
+    Mathematical Background:
+        For an 8-bit color channel, posterization to n bits can be expressed as:
+        new_value = (old_value >> (8 - n)) << (8 - n)
+        This operation keeps the n most significant bits and sets the rest to zero.
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+
+        # Posterize all channels to 3 bits
+        >>> transform = A.Posterize(num_bits=3, p=1.0)
+        >>> posterized_image = transform(image=image)["image"]
+
+        # Randomly posterize between 2 and 5 bits
+        >>> transform = A.Posterize(num_bits=(2, 5), p=1.0)
+        >>> posterized_image = transform(image=image)["image"]
+
+        # Different bits for each channel
+        >>> transform = A.Posterize(num_bits=[3, 5, 2], p=1.0)
+        >>> posterized_image = transform(image=image)["image"]
+
+        # Range of bits for each channel
+        >>> transform = A.Posterize(num_bits=[(1, 3), (3, 5), (2, 4)], p=1.0)
+        >>> posterized_image = transform(image=image)["image"]
+
+    References:
+        - Color Quantization: https://en.wikipedia.org/wiki/Color_quantization
+        - Posterization: https://en.wikipedia.org/wiki/Posterization
     """
 
-    def __init__(self, num_bits=4, always_apply=False, p=0.5):
-        super(Posterize, self).__init__(always_apply, p)
+    class InitSchema(BaseTransformInitSchema):
+        num_bits: Annotated[
+            int | tuple[int, int] | list[tuple[int, int]],
+            Field(default=4, description="Number of high bits"),
+        ]
 
-        if isinstance(num_bits, (list, tuple)):
-            if len(num_bits) == 3:
-                self.num_bits = [to_tuple(i, 0) for i in num_bits]
-            else:
-                self.num_bits = to_tuple(num_bits, 0)
-        else:
-            self.num_bits = to_tuple(num_bits, num_bits)
+        @field_validator("num_bits")
+        @classmethod
+        def validate_num_bits(cls, num_bits: Any) -> tuple[int, int] | list[tuple[int, int]]:
+            if isinstance(num_bits, int):
+                return cast(Tuple[int, int], to_tuple(num_bits, num_bits))
+            if isinstance(num_bits, Sequence) and len(num_bits) == NUM_BITS_ARRAY_LENGTH:
+                return [cast(Tuple[int, int], to_tuple(i, 0)) for i in num_bits]
+            return cast(Tuple[int, int], to_tuple(num_bits, 0))
 
-    def apply(self, image, num_bits=1, **params):
-        return F.posterize(image, num_bits)
+    def __init__(
+        self,
+        num_bits: int | tuple[int, int] | list[tuple[int, int]] = 4,
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.num_bits = cast(Union[Tuple[int, ...], List[Tuple[int, ...]]], num_bits)
 
-    def get_params(self):
-        if len(self.num_bits) == 3:
-            return {"num_bits": [random.randint(i[0], i[1]) for i in self.num_bits]}
-        return {"num_bits": random.randint(self.num_bits[0], self.num_bits[1])}
+    def apply(self, img: np.ndarray, num_bits: int, **params: Any) -> np.ndarray:
+        return fmain.posterize(img, num_bits)
 
-    def get_transform_init_args_names(self):
+    def get_params(self) -> dict[str, Any]:
+        if len(self.num_bits) == NUM_BITS_ARRAY_LENGTH:
+            return {"num_bits": [random.randint(int(i[0]), int(i[1])) for i in self.num_bits]}  # type: ignore[index]
+        num_bits = self.num_bits
+        return {"num_bits": random.randint(int(num_bits[0]), int(num_bits[1]))}  # type: ignore[arg-type]
+
+    def get_transform_init_args_names(self) -> tuple[str]:
         return ("num_bits",)
 
 
 class Equalize(ImageOnlyTransform):
     """Equalize the image histogram.
 
+    This transform applies histogram equalization to the input image. Histogram equalization
+    is a method in image processing of contrast adjustment using the image's histogram.
+
     Args:
-        mode (str): {'cv', 'pil'}. Use OpenCV or Pillow equalization method.
+        mode (Literal['cv', 'pil']): Use OpenCV or Pillow equalization method.
+            Default: 'cv'
         by_channels (bool): If True, use equalization by channels separately,
             else convert image to YCbCr representation and use equalization by `Y` channel.
+            Default: True
         mask (np.ndarray, callable): If given, only the pixels selected by
-            the mask are included in the analysis. Maybe 1 channel or 3 channel array or callable.
-            Function signature must include `image` argument.
-        mask_params (list of str): Params for mask function.
+            the mask are included in the analysis. Can be:
+            - A 1-channel or 3-channel numpy array of the same size as the input image.
+            - A callable (function) that generates a mask. The function should accept 'image'
+              as its first argument, and can accept additional arguments specified in mask_params.
+            Default: None
+        mask_params (list[str]): Additional parameters to pass to the mask function.
+            These parameters will be taken from the data dict passed to __call__.
+            Default: ()
+        p (float): Probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
-        uint8
+        uint8, float32
 
+    Note:
+        - When mode='cv', OpenCV's equalizeHist() function is used.
+        - When mode='pil', Pillow's equalize() function is used.
+        - The 'by_channels' parameter determines whether equalization is applied to each color channel
+          independently (True) or to the luminance channel only (False).
+        - If a mask is provided as a numpy array, it should have the same height and width as the input image.
+        - If a mask is provided as a function, it allows for dynamic mask generation based on the input image
+          and additional parameters. This is useful for scenarios where the mask depends on the image content
+          or external data (e.g., bounding boxes, segmentation masks).
+
+    Mask Function:
+        When mask is a callable, it should have the following signature:
+        mask_func(image, *args) -> np.ndarray
+
+        - image: The input image (numpy array)
+        - *args: Additional arguments as specified in mask_params
+
+        The function should return a numpy array of the same height and width as the input image,
+        where non-zero pixels indicate areas to be equalized.
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>>
+        >>> # Using a static mask
+        >>> mask = np.random.randint(0, 2, (100, 100), dtype=np.uint8)
+        >>> transform = A.Equalize(mask=mask, p=1.0)
+        >>> result = transform(image=image)
+        >>>
+        >>> # Using a dynamic mask function
+        >>> def mask_func(image, bboxes):
+        ...     mask = np.ones_like(image[:, :, 0], dtype=np.uint8)
+        ...     for bbox in bboxes:
+        ...         x1, y1, x2, y2 = map(int, bbox)
+        ...         mask[y1:y2, x1:x2] = 0  # Exclude areas inside bounding boxes
+        ...     return mask
+        >>>
+        >>> transform = A.Equalize(mask=mask_func, mask_params=['bboxes'], p=1.0)
+        >>> bboxes = [(10, 10, 50, 50), (60, 60, 90, 90)]  # Example bounding boxes
+        >>> result = transform(image=image, bboxes=bboxes)
+
+    References:
+        - OpenCV equalizeHist: https://docs.opencv.org/3.4/d6/dc7/group__imgproc__hist.html#ga7e54091f0c937d49bf84152a16f76d6e
+        - Pillow ImageOps.equalize: https://pillow.readthedocs.io/en/stable/reference/ImageOps.html#PIL.ImageOps.equalize
+        - Histogram Equalization: https://en.wikipedia.org/wiki/Histogram_equalization
     """
 
-    def __init__(self, mode="cv", by_channels=True, mask=None, mask_params=(), always_apply=False, p=0.5):
-        modes = ["cv", "pil"]
-        if mode not in modes:
-            raise ValueError("Unsupported equalization mode. Supports: {}. " "Got: {}".format(modes, mode))
+    class InitSchema(BaseTransformInitSchema):
+        mode: ImageMode
+        by_channels: bool
+        mask: np.ndarray | Callable[..., Any] | None
+        mask_params: Sequence[str]
 
-        super(Equalize, self).__init__(always_apply, p)
+    def __init__(
+        self,
+        mode: ImageMode = "cv",
+        by_channels: bool = True,
+        mask: np.ndarray | Callable[..., Any] | None = None,
+        mask_params: Sequence[str] = (),
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+
         self.mode = mode
         self.by_channels = by_channels
         self.mask = mask
         self.mask_params = mask_params
 
-    def apply(self, image, mask=None, **params):
-        return F.equalize(image, mode=self.mode, by_channels=self.by_channels, mask=mask)
+    def apply(self, img: np.ndarray, mask: np.ndarray, **params: Any) -> np.ndarray:
+        return fmain.equalize(img, mode=self.mode, by_channels=self.by_channels, mask=mask)
 
-    def get_params_dependent_on_targets(self, params):
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
         if not callable(self.mask):
             return {"mask": self.mask}
 
-        return {"mask": self.mask(**params)}
+        mask_params = {"image": data["image"]}
+        for key in self.mask_params:
+            if key not in data:
+                raise KeyError(f"Required parameter '{key}' for mask function is missing in data.")
+            mask_params[key] = data[key]
+
+        return {"mask": self.mask(**mask_params)}
 
     @property
-    def targets_as_params(self):
-        return ["image"] + list(self.mask_params)
+    def targets_as_params(self) -> list[str]:
+        return ["image", *list(self.mask_params)]
 
-    def get_transform_init_args_names(self):
-        return ("mode", "by_channels")
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return "mode", "by_channels", "mask", "mask_params"
 
 
 class RGBShift(ImageOnlyTransform):
-    """Randomly shift values for each channel of the input RGB image.
+    """Randomly shifts the values of each RGB channel independently.
+
+    This transform adjusts the intensity of the red, green, and blue channels of an image
+    by adding a random value within a specified range to each channel. This can be used to
+    simulate color variations caused by different lighting conditions or camera sensors.
 
     Args:
-        r_shift_limit ((int, int) or int): range for changing values for the red channel. If r_shift_limit is a single
-            int, the range will be (-r_shift_limit, r_shift_limit). Default: (-20, 20).
-        g_shift_limit ((int, int) or int): range for changing values for the green channel. If g_shift_limit is a
-            single int, the range  will be (-g_shift_limit, g_shift_limit). Default: (-20, 20).
-        b_shift_limit ((int, int) or int): range for changing values for the blue channel. If b_shift_limit is a single
-            int, the range will be (-b_shift_limit, b_shift_limit). Default: (-20, 20).
-        p (float): probability of applying the transform. Default: 0.5.
+        r_shift_limit (float | tuple[float, float]): Range for changing values for the red channel.
+            If r_shift_limit is a single int or float, the range will be (-r_shift_limit, r_shift_limit).
+            Default: (-20, 20).
+        g_shift_limit (float | tuple[float, float]): Range for changing values for the green channel.
+            If g_shift_limit is a single int or float, the range will be (-g_shift_limit, g_shift_limit).
+            Default: (-20, 20).
+        b_shift_limit (float | tuple[float, float]): Range for changing values for the blue channel.
+            If b_shift_limit is a single int or float, the range will be (-b_shift_limit, b_shift_limit).
+            Default: (-20, 20).
+        p (float): Probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - The shift values are sampled independently for each channel.
+        - Positive shifts increase the intensity of a color channel, while negative shifts decrease it.
+        - For uint8 images, the resulting pixel values are clipped to the [0, 255] range.
+        - For float32 images, the values are typically in the [0, 1] range but may exceed it after shifting.
+        - This transform can be used to:
+          * Simulate variations in color balance
+          * Create subtle color casts
+          * Augment data for improving model robustness to color variations
+
+    Mathematical formula:
+        For each channel c in [r, g, b]:
+        output_c = input_c + shift_c
+        where shift_c is randomly sampled from the corresponding shift_limit range.
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+
+        # Default usage
+        >>> transform = A.RGBShift(p=1.0)
+        >>> augmented_image = transform(image=image)["image"]
+
+        # Custom shift ranges for each channel
+        >>> transform = A.RGBShift(r_shift_limit=30, g_shift_limit=(-20, 20), b_shift_limit=(-10, 10), p=1.0)
+        >>> augmented_image = transform(image=image)["image"]
+
+        # Using float values for more precise control
+        >>> transform = A.RGBShift(r_shift_limit=(-0.1, 0.1), g_shift_limit=0.2, b_shift_limit=(-0.3, 0.3), p=1.0)
+        >>> augmented_image = transform(image=image)["image"]
+
+    References:
+        - Color balance: https://en.wikipedia.org/wiki/Color_balance
+        - Color cast: https://en.wikipedia.org/wiki/Color_cast
     """
 
-    def __init__(self, r_shift_limit=20, g_shift_limit=20, b_shift_limit=20, always_apply=False, p=0.5):
-        super(RGBShift, self).__init__(always_apply, p)
-        self.r_shift_limit = to_tuple(r_shift_limit)
-        self.g_shift_limit = to_tuple(g_shift_limit)
-        self.b_shift_limit = to_tuple(b_shift_limit)
+    class InitSchema(BaseTransformInitSchema):
+        r_shift_limit: SymmetricRangeType
+        g_shift_limit: SymmetricRangeType
+        b_shift_limit: SymmetricRangeType
 
-    def apply(self, image, r_shift=0, g_shift=0, b_shift=0, **params):
-        return F.shift_rgb(image, r_shift, g_shift, b_shift)
+    def __init__(
+        self,
+        r_shift_limit: ScaleFloatType = (-20, 20),
+        g_shift_limit: ScaleFloatType = (-20, 20),
+        b_shift_limit: ScaleFloatType = (-20, 20),
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.r_shift_limit = cast(Tuple[float, float], r_shift_limit)
+        self.g_shift_limit = cast(Tuple[float, float], g_shift_limit)
+        self.b_shift_limit = cast(Tuple[float, float], b_shift_limit)
 
-    def get_params(self):
+    def apply(self, img: np.ndarray, shift: np.ndarray, **params: Any) -> np.ndarray:
+        if not is_rgb_image(img):
+            msg = "RGBShift transformation expects 3-channel images."
+            raise TypeError(msg)
+
+        return albucore.add_vector(img, shift)
+
+    def get_params(self) -> dict[str, Any]:
         return {
-            "r_shift": random.uniform(self.r_shift_limit[0], self.r_shift_limit[1]),
-            "g_shift": random.uniform(self.g_shift_limit[0], self.g_shift_limit[1]),
-            "b_shift": random.uniform(self.b_shift_limit[0], self.b_shift_limit[1]),
+            "shift": np.array(
+                [
+                    random.uniform(*self.r_shift_limit),
+                    random.uniform(*self.g_shift_limit),
+                    random.uniform(*self.b_shift_limit),
+                ],
+            ),
         }
 
-    def get_transform_init_args_names(self):
-        return ("r_shift_limit", "g_shift_limit", "b_shift_limit")
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return "r_shift_limit", "g_shift_limit", "b_shift_limit"
 
 
 class RandomBrightnessContrast(ImageOnlyTransform):
-    """Randomly change brightness and contrast of the input image.
+    """Randomly changes the brightness and contrast of the input image.
+
+    This transform adjusts the brightness and contrast of an image simultaneously, allowing for
+    a wide range of lighting and contrast variations. It's particularly useful for data augmentation
+    in computer vision tasks, helping models become more robust to different lighting conditions.
 
     Args:
-        brightness_limit ((float, float) or float): factor range for changing brightness.
-            If limit is a single float, the range will be (-limit, limit). Default: (-0.2, 0.2).
-        contrast_limit ((float, float) or float): factor range for changing contrast.
-            If limit is a single float, the range will be (-limit, limit). Default: (-0.2, 0.2).
-        brightness_by_max (Boolean): If True adjust contrast by image dtype maximum,
-            else adjust contrast by image mean.
-        p (float): probability of applying the transform. Default: 0.5.
+        brightness_limit (float | tuple[float, float]): Factor range for changing brightness.
+            If a single float value is provided, the range will be (-brightness_limit, brightness_limit).
+            Values should typically be in the range [-1.0, 1.0], where 0 means no change,
+            1.0 means maximum brightness, and -1.0 means minimum brightness.
+            Default: (-0.2, 0.2).
+
+        contrast_limit (float | tuple[float, float]): Factor range for changing contrast.
+            If a single float value is provided, the range will be (-contrast_limit, contrast_limit).
+            Values should typically be in the range [-1.0, 1.0], where 0 means no change,
+            1.0 means maximum increase in contrast, and -1.0 means maximum decrease in contrast.
+            Default: (-0.2, 0.2).
+
+        brightness_by_max (bool): If True, adjusts brightness by scaling pixel values up to the
+            maximum value of the image's dtype. If False, uses the mean pixel value for adjustment.
+            Default: True.
+
+        p (float): Probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - The order of operation is: contrast adjustment, then brightness adjustment.
+        - For uint8 images, the output is clipped to [0, 255] range.
+        - For float32 images, the output may exceed the [0, 1] range.
+        - The `brightness_by_max` parameter affects how brightness is adjusted:
+          * If True, brightness adjustment is more pronounced and can lead to more saturated results.
+          * If False, brightness adjustment is more subtle and preserves the overall lighting better.
+        - This transform is useful for:
+          * Simulating different lighting conditions
+          * Enhancing low-light or overexposed images
+          * Data augmentation to improve model robustness
+
+    Mathematical Formulation:
+        Let a be the contrast adjustment factor and β be the brightness adjustment factor.
+        For each pixel value x:
+        1. Contrast adjustment: x' = clip((x - mean) * (1 + a) + mean)
+        2. Brightness adjustment:
+           If brightness_by_max is True:  x'' = clip(x' * (1 + β))
+           If brightness_by_max is False: x'' = clip(x' + β * max_value)
+        Where clip() ensures values stay within the valid range for the image dtype.
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+
+        # Default usage
+        >>> transform = A.RandomBrightnessContrast(p=1.0)
+        >>> augmented_image = transform(image=image)["image"]
+
+        # Custom brightness and contrast limits
+        >>> transform = A.RandomBrightnessContrast(
+        ...     brightness_limit=0.3,
+        ...     contrast_limit=0.3,
+        ...     p=1.0
+        ... )
+        >>> augmented_image = transform(image=image)["image"]
+
+        # Adjust brightness based on mean value
+        >>> transform = A.RandomBrightnessContrast(
+        ...     brightness_limit=0.2,
+        ...     contrast_limit=0.2,
+        ...     brightness_by_max=False,
+        ...     p=1.0
+        ... )
+        >>> augmented_image = transform(image=image)["image"]
+
+    References:
+        - Brightness: https://en.wikipedia.org/wiki/Brightness
+        - Contrast: https://en.wikipedia.org/wiki/Contrast_(vision)
     """
 
-    def __init__(self, brightness_limit=0.2, contrast_limit=0.2, brightness_by_max=True, always_apply=False, p=0.5):
-        super(RandomBrightnessContrast, self).__init__(always_apply, p)
-        self.brightness_limit = to_tuple(brightness_limit)
-        self.contrast_limit = to_tuple(contrast_limit)
+    class InitSchema(BaseTransformInitSchema):
+        brightness_limit: SymmetricRangeType
+        contrast_limit: SymmetricRangeType
+        brightness_by_max: bool
+
+    def __init__(
+        self,
+        brightness_limit: ScaleFloatType = (-0.2, 0.2),
+        contrast_limit: ScaleFloatType = (-0.2, 0.2),
+        brightness_by_max: bool = True,
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.brightness_limit = cast(Tuple[float, float], brightness_limit)
+        self.contrast_limit = cast(Tuple[float, float], contrast_limit)
         self.brightness_by_max = brightness_by_max
 
-    def apply(self, img, alpha=1.0, beta=0.0, **params):
-        return F.brightness_contrast_adjust(img, alpha, beta, self.brightness_by_max)
+    def apply(self, img: np.ndarray, alpha: float, beta: float, **params: Any) -> np.ndarray:
+        return fmain.brightness_contrast_adjust(img, alpha, beta, self.brightness_by_max)
 
-    def get_params(self):
+    def get_params(self) -> dict[str, float]:
         return {
-            "alpha": 1.0 + random.uniform(self.contrast_limit[0], self.contrast_limit[1]),
-            "beta": 0.0 + random.uniform(self.brightness_limit[0], self.brightness_limit[1]),
+            "alpha": 1.0 + random.uniform(*self.contrast_limit),
+            "beta": 0.0 + random.uniform(*self.brightness_limit),
         }
 
-    def get_transform_init_args_names(self):
-        return ("brightness_limit", "contrast_limit", "brightness_by_max")
-
-
-class RandomBrightness(RandomBrightnessContrast):
-    """Randomly change brightness of the input image.
-
-    Args:
-        limit ((float, float) or float): factor range for changing brightness.
-            If limit is a single float, the range will be (-limit, limit). Default: (-0.2, 0.2).
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, limit=0.2, always_apply=False, p=0.5):
-        super(RandomBrightness, self).__init__(
-            brightness_limit=limit, contrast_limit=0, always_apply=always_apply, p=p
-        )
-        warnings.warn("This class has been deprecated. Please use RandomBrightnessContrast", DeprecationWarning)
-
-    def get_transform_init_args(self):
-        return {"limit": self.brightness_limit}
-
-
-class RandomContrast(RandomBrightnessContrast):
-    """Randomly change contrast of the input image.
-
-    Args:
-        limit ((float, float) or float): factor range for changing contrast.
-            If limit is a single float, the range will be (-limit, limit). Default: (-0.2, 0.2).
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, limit=0.2, always_apply=False, p=0.5):
-        super(RandomContrast, self).__init__(brightness_limit=0, contrast_limit=limit, always_apply=always_apply, p=p)
-        warnings.warn("This class has been deprecated. Please use RandomBrightnessContrast", DeprecationWarning)
-
-    def get_transform_init_args(self):
-        return {"limit": self.contrast_limit}
-
-
-class Blur(ImageOnlyTransform):
-    """Blur the input image using a random-sized kernel.
-
-    Args:
-        blur_limit (int, (int, int)): maximum kernel size for blurring the input image.
-            Should be in range [3, inf). Default: (3, 7).
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, blur_limit=7, always_apply=False, p=0.5):
-        super(Blur, self).__init__(always_apply, p)
-        self.blur_limit = to_tuple(blur_limit, 3)
-
-    def apply(self, image, ksize=3, **params):
-        return F.blur(image, ksize)
-
-    def get_params(self):
-        return {"ksize": int(random.choice(np.arange(self.blur_limit[0], self.blur_limit[1] + 1, 2)))}
-
-    def get_transform_init_args_names(self):
-        return ("blur_limit",)
-
-
-class MotionBlur(Blur):
-    """Apply motion blur to the input image using a random-sized kernel.
-
-    Args:
-        blur_limit (int): maximum kernel size for blurring the input image.
-            Should be in range [3, inf). Default: (3, 7).
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-    """
-
-    def apply(self, img, kernel=None, **params):
-        return F.motion_blur(img, kernel=kernel)
-
-    def get_params(self):
-        ksize = random.choice(np.arange(self.blur_limit[0], self.blur_limit[1] + 1, 2))
-        assert ksize > 2
-        kernel = np.zeros((ksize, ksize), dtype=np.uint8)
-        xs, xe = random.randint(0, ksize - 1), random.randint(0, ksize - 1)
-        if xs == xe:
-            ys, ye = random.sample(range(ksize), 2)
-        else:
-            ys, ye = random.randint(0, ksize - 1), random.randint(0, ksize - 1)
-        cv2.line(kernel, (xs, ys), (xe, ye), 1, thickness=1)
-
-        # Normalize kernel
-        kernel = kernel.astype(np.float32) / np.sum(kernel)
-        return {"kernel": kernel}
-
-
-class MedianBlur(Blur):
-    """Blur the input image using using a median filter with a random aperture linear size.
-
-    Args:
-        blur_limit (int): maximum aperture linear size for blurring the input image.
-            Must be odd and in range [3, inf). Default: (3, 7).
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, blur_limit=7, always_apply=False, p=0.5):
-        super(MedianBlur, self).__init__(blur_limit, always_apply, p)
-
-    def apply(self, image, ksize=3, **params):
-        return F.median_blur(image, ksize)
-
-
-class GaussianBlur(Blur):
-    """Blur the input image using using a Gaussian filter with a random kernel size.
-
-    Args:
-        blur_limit (int): maximum Gaussian kernel size for blurring the input image.
-            Must be zero or odd and in range [3, inf). Default: (3, 7).
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image
-
-    Image types:
-        uint8, float32
-    """
-
-    def __init__(self, blur_limit=7, always_apply=False, p=0.5):
-        super(GaussianBlur, self).__init__(blur_limit, always_apply, p)
-
-    def apply(self, image, ksize=3, **params):
-        return F.gaussian_blur(image, ksize)
+    def get_transform_init_args_names(self) -> tuple[str, str, str]:
+        return "brightness_limit", "contrast_limit", "brightness_by_max"
 
 
 class GaussNoise(ImageOnlyTransform):
-    """Apply gaussian noise to the input image.
+    """Apply Gaussian noise to the input image.
 
     Args:
-        var_limit ((float, float) or float): variance range for noise. If var_limit is a single float, the range
-            will be (0, var_limit). Default: (10.0, 50.0).
-        mean (float): mean of the noise. Default: 0
-        p (float): probability of applying the transform. Default: 0.5.
+        var_limit (tuple[float, float] | float): Variance range for noise. If var_limit is a single float value,
+            the range will be (0, var_limit). Default: (10.0, 50.0).
+        mean (float): Mean of the noise. Default: 0.
+        per_channel (bool): If True, noise will be sampled for each channel independently.
+            Otherwise, the noise will be sampled once for all channels. Default: True.
+        noise_scale_factor (float): Scaling factor for noise generation. Value should be in the range (0, 1].
+            When set to 1, noise is sampled for each pixel independently. If less, noise is sampled for a smaller size
+            and resized to fit the shape of the image. Smaller values make the transform faster. Default: 1.0.
+        p (float): Probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
+    Number of channels:
+        Any
+
+    Returns:
+        numpy.ndarray: Image with applied Gaussian noise.
+
+    Note:
+        - The noise is generated in the same range as the input image.
+        - For uint8 input images, the noise is generated in the range [0, 255].
+        - For float32 input images, the noise is generated in the range [0, 1].
+        - The resulting image is clipped to keep its values in the input range.
+        - Setting per_channel=False is faster but applies the same noise to all channels.
+        - The noise_scale_factor parameter allows for a trade-off between transform speed and noise granularity.
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (224, 224, 3), dtype=np.uint8)
+        >>>
+        >>> # Apply Gaussian noise with default parameters
+        >>> transform = A.GaussNoise(p=1.0)
+        >>> noisy_image = transform(image=image)['image']
+        >>>
+        >>> # Apply Gaussian noise with custom variance range and mean
+        >>> transform = A.GaussNoise(var_limit=(50.0, 100.0), mean=10, p=1.0)
+        >>> noisy_image = transform(image=image)['image']
+        >>>
+        >>> # Apply the same noise to all channels
+        >>> transform = A.GaussNoise(per_channel=False, p=1.0)
+        >>> noisy_image = transform(image=image)['image']
+        >>>
+        >>> # Apply noise with reduced granularity for faster processing
+        >>> transform = A.GaussNoise(noise_scale_factor=0.5, p=1.0)
+        >>> noisy_image = transform(image=image)['image']
+
     """
 
-    def __init__(self, var_limit=(10.0, 50.0), mean=0, always_apply=False, p=0.5):
-        super(GaussNoise, self).__init__(always_apply, p)
-        if isinstance(var_limit, tuple):
-            if var_limit[0] < 0:
-                raise ValueError("Lower var_limit should be non negative.")
-            if var_limit[1] < 0:
-                raise ValueError("Upper var_limit should be non negative.")
-            self.var_limit = var_limit
-        elif isinstance(var_limit, (int, float)):
-            if var_limit < 0:
-                raise ValueError(" var_limit should be non negative.")
+    class InitSchema(BaseTransformInitSchema):
+        var_limit: NonNegativeFloatRangeType
+        mean: float
+        per_channel: bool
+        noise_scale_factor: float = Field(gt=0, le=1)
 
-            self.var_limit = (0, var_limit)
-
+    def __init__(
+        self,
+        var_limit: ScaleFloatType = (10.0, 50.0),
+        mean: float = 0,
+        per_channel: bool = True,
+        noise_scale_factor: float = 1,
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.var_limit = cast(Tuple[float, float], var_limit)
         self.mean = mean
+        self.per_channel = per_channel
+        self.noise_scale_factor = noise_scale_factor
 
-    def apply(self, img, gauss=None, **params):
-        return F.gauss_noise(img, gauss=gauss)
+    def apply(self, img: np.ndarray, gauss: np.ndarray, **params: Any) -> np.ndarray:
+        return fmain.add_noise(img, gauss)
 
-    def get_params_dependent_on_targets(self, params):
-        image = params["image"]
-        var = random.uniform(self.var_limit[0], self.var_limit[1])
-        sigma = var ** 0.5
-        random_state = np.random.RandomState(random.randint(0, 2 ** 32 - 1))
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, float]:
+        image = data["image"] if "image" in data else data["images"][0]
+        var = random.uniform(*self.var_limit)
+        sigma = math.sqrt(var)
 
-        gauss = random_state.normal(self.mean, sigma, image.shape)
+        if self.per_channel:
+            target_shape = image.shape
+            if self.noise_scale_factor == 1:
+                gauss = random_utils.normal(self.mean, sigma, target_shape)
+            else:
+                gauss = fmain.generate_approx_gaussian_noise(target_shape, self.mean, sigma, self.noise_scale_factor)
+        else:
+            target_shape = image.shape[:2]
+            if self.noise_scale_factor == 1:
+                gauss = random_utils.normal(self.mean, sigma, target_shape)
+            else:
+                gauss = fmain.generate_approx_gaussian_noise(target_shape, self.mean, sigma, self.noise_scale_factor)
+
+            if image.ndim > MONO_CHANNEL_DIMENSIONS:
+                gauss = np.expand_dims(gauss, -1)
+
         return {"gauss": gauss}
 
-    @property
-    def targets_as_params(self):
-        return ["image"]
-
-    def get_transform_init_args_names(self):
-        return ("var_limit",)
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return "var_limit", "per_channel", "mean", "noise_scale_factor"
 
 
 class ISONoise(ImageOnlyTransform):
-    """
-    Apply camera sensor noise.
+    """Applies camera sensor noise to the input image, simulating high ISO settings.
+
+    This transform adds random noise to an image, mimicking the effect of using high ISO settings
+    in digital photography. It simulates two main components of ISO noise:
+    1. Color noise: random shifts in color hue
+    2. Luminance noise: random variations in pixel intensity
 
     Args:
-        color_shift (float, float): variance range for color hue change.
-            Measured as a fraction of 360 degree Hue angle in HLS colorspace.
-        intensity ((float, float): Multiplicative factor that control strength
-            of color and luminace noise.
-        p (float): probability of applying the transform. Default: 0.5.
+        color_shift (tuple[float, float]): Range for changing color hue.
+            Values should be in the range [0, 1], where 1 represents a full 360° hue rotation.
+            Default: (0.01, 0.05)
 
-    Targets:
-        image
+        intensity (tuple[float, float]): Range for the noise intensity.
+            Higher values increase the strength of both color and luminance noise.
+            Default: (0.1, 0.5)
 
-    Image types:
-        uint8
-    """
-
-    def __init__(self, color_shift=(0.01, 0.05), intensity=(0.1, 0.5), always_apply=False, p=0.5):
-        super(ISONoise, self).__init__(always_apply, p)
-        self.intensity = intensity
-        self.color_shift = color_shift
-
-    def apply(self, img, color_shift=0.05, intensity=1.0, random_state=None, **params):
-        return F.iso_noise(img, color_shift, intensity, np.random.RandomState(random_state))
-
-    def get_params(self):
-        return {
-            "color_shift": random.uniform(self.color_shift[0], self.color_shift[1]),
-            "intensity": random.uniform(self.intensity[0], self.intensity[1]),
-            "random_state": random.randint(0, 65536),
-        }
-
-    def get_transform_init_args_names(self):
-        return ("intensity", "color_shift")
-
-
-class CLAHE(ImageOnlyTransform):
-    """Apply Contrast Limited Adaptive Histogram Equalization to the input image.
-
-    Args:
-        clip_limit (float or (float, float)): upper threshold value for contrast limiting.
-            If clip_limit is a single float value, the range will be (1, clip_limit). Default: (1, 4).
-        tile_grid_size ((int, int)): size of grid for histogram equalization. Default: (8, 8).
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image
-
-    Image types:
-        uint8
-    """
-
-    def __init__(self, clip_limit=4.0, tile_grid_size=(8, 8), always_apply=False, p=0.5):
-        super(CLAHE, self).__init__(always_apply, p)
-        self.clip_limit = to_tuple(clip_limit, 1)
-        self.tile_grid_size = tuple(tile_grid_size)
-
-    def apply(self, img, clip_limit=2, **params):
-        return F.clahe(img, clip_limit, self.tile_grid_size)
-
-    def get_params(self):
-        return {"clip_limit": random.uniform(self.clip_limit[0], self.clip_limit[1])}
-
-    def get_transform_init_args_names(self):
-        return ("clip_limit", "tile_grid_size")
-
-
-class ChannelDropout(ImageOnlyTransform):
-    """Randomly Drop Channels in the input Image.
-
-    Args:
-        channel_drop_range (int, int): range from which we choose the number of channels to drop.
-        fill_value (int, float): pixel value for the dropped channel.
-        p (float): probability of applying the transform. Default: 0.5.
-
-    Targets:
-        image
-
-    Image types:
-        uint8, uint16, unit32, float32
-    """
-
-    def __init__(self, channel_drop_range=(1, 1), fill_value=0, always_apply=False, p=0.5):
-        super(ChannelDropout, self).__init__(always_apply, p)
-
-        self.channel_drop_range = channel_drop_range
-
-        self.min_channels = channel_drop_range[0]
-        self.max_channels = channel_drop_range[1]
-
-        assert 1 <= self.min_channels <= self.max_channels
-
-        self.fill_value = fill_value
-
-    def apply(self, img, channels_to_drop=(0,), **params):
-        return F.channel_dropout(img, channels_to_drop, self.fill_value)
-
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-
-        num_channels = img.shape[-1]
-
-        if len(img.shape) == 2 or num_channels == 1:
-            raise NotImplementedError("Images has one channel. ChannelDropout is not defined.")
-
-        if self.max_channels >= num_channels:
-            raise ValueError("Can not drop all channels in ChannelDropout.")
-
-        num_drop_channels = random.randint(self.min_channels, self.max_channels)
-
-        channels_to_drop = random.sample(range(num_channels), k=num_drop_channels)
-
-        return {"channels_to_drop": channels_to_drop}
-
-    def get_transform_init_args_names(self):
-        return ("channel_drop_range", "fill_value")
-
-    @property
-    def targets_as_params(self):
-        return ["image"]
-
-
-class ChannelShuffle(ImageOnlyTransform):
-    """Randomly rearrange channels of the input RGB image.
-
-    Args:
-        p (float): probability of applying the transform. Default: 0.5.
+        p (float): Probability of applying the transform. Default: 0.5
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
+    Number of channels:
+        3
+
+    Note:
+        - This transform only works with RGB images. It will raise a TypeError if applied to
+          non-RGB images.
+        - The color shift is applied in the HSV color space, affecting the hue channel.
+        - Luminance noise is added to all channels independently.
+        - This transform can be useful for data augmentation in low-light scenarios or when
+          training models to be robust against noisy inputs.
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>> transform = A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=0.5)
+        >>> result = transform(image=image)
+        >>> noisy_image = result["image"]
+
+    References:
+        - ISO noise in digital photography:
+          https://en.wikipedia.org/wiki/Image_noise#In_digital_cameras
     """
 
-    @property
-    def targets_as_params(self):
-        return ["image"]
+    class InitSchema(BaseTransformInitSchema):
+        color_shift: Annotated[tuple[float, float], AfterValidator(check_01), AfterValidator(nondecreasing)]
+        intensity: Annotated[tuple[float, float], AfterValidator(check_0plus), AfterValidator(nondecreasing)]
 
-    def apply(self, img, channels_shuffled=[0, 1, 2], **params):
-        return F.channel_shuffle(img, channels_shuffled)
+    def __init__(
+        self,
+        color_shift: tuple[float, float] = (0.01, 0.05),
+        intensity: tuple[float, float] = (0.1, 0.5),
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.intensity = intensity
+        self.color_shift = color_shift
 
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-        ch_arr = list(range(img.shape[2]))
-        random.shuffle(ch_arr)
+    def apply(
+        self,
+        img: np.ndarray,
+        color_shift: float,
+        intensity: float,
+        random_seed: int,
+        **params: Any,
+    ) -> np.ndarray:
+        non_rgb_error(img)
+        return fmain.iso_noise(img, color_shift, intensity, np.random.RandomState(random_seed))
+
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "color_shift": random.uniform(*self.color_shift),
+            "intensity": random.uniform(*self.intensity),
+            "random_seed": random_utils.get_random_seed(),
+        }
+
+    def get_transform_init_args_names(self) -> tuple[str, str]:
+        return "intensity", "color_shift"
+
+
+class CLAHE(ImageOnlyTransform):
+    """Apply Contrast Limited Adaptive Histogram Equalization (CLAHE) to the input image.
+
+    CLAHE is an advanced method of improving the contrast in an image. Unlike regular histogram
+    equalization, which operates on the entire image, CLAHE operates on small regions (tiles)
+    in the image. This results in a more balanced equalization, preventing over-amplification
+    of contrast in areas with initially low contrast.
+
+    Args:
+        clip_limit (tuple[float, float] | float): Controls the contrast enhancement limit.
+            - If a single float is provided, the range will be (1, clip_limit).
+            - If a tuple of two floats is provided, it defines the range for random selection.
+            Higher values allow for more contrast enhancement, but may also increase noise.
+            Default: (1, 4)
+
+        tile_grid_size (tuple[int, int]): Defines the number of tiles in the row and column directions.
+            Format is (rows, columns). Smaller tile sizes can lead to more localized enhancements,
+            while larger sizes give results closer to global histogram equalization.
+            Default: (8, 8)
+
+        p (float): Probability of applying the transform. Default: 0.5
+
+    Notes:
+        - Supports only RGB or grayscale images.
+        - For color images, CLAHE is applied to the L channel in the LAB color space.
+        - The clip limit determines the maximum slope of the cumulative histogram. A lower
+          clip limit will result in more contrast limiting.
+        - Tile grid size affects the adaptiveness of the method. More tiles increase local
+          adaptiveness but can lead to an unnatural look if set too high.
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>> transform = A.CLAHE(clip_limit=(1, 4), tile_grid_size=(8, 8), p=1.0)
+        >>> result = transform(image=image)
+        >>> clahe_image = result["image"]
+
+    References:
+        - https://docs.opencv.org/master/d5/daf/tutorial_py_histogram_equalization.html
+        - Zuiderveld, Karel. "Contrast Limited Adaptive Histogram Equalization."
+          Graphic Gems IV. Academic Press Professional, Inc., 1994.
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        clip_limit: OnePlusFloatRangeType
+        tile_grid_size: Annotated[tuple[int, int], AfterValidator(check_1plus)]
+
+    def __init__(
+        self,
+        clip_limit: ScaleFloatType = 4.0,
+        tile_grid_size: tuple[int, int] = (8, 8),
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.clip_limit = cast(Tuple[float, float], clip_limit)
+        self.tile_grid_size = tile_grid_size
+
+    def apply(self, img: np.ndarray, clip_limit: float, **params: Any) -> np.ndarray:
+        if not is_rgb_image(img) and not is_grayscale_image(img):
+            msg = "CLAHE transformation expects 1-channel or 3-channel images."
+            raise TypeError(msg)
+
+        return fmain.clahe(img, clip_limit, self.tile_grid_size)
+
+    def get_params(self) -> dict[str, float]:
+        return {"clip_limit": random.uniform(*self.clip_limit)}
+
+    def get_transform_init_args_names(self) -> tuple[str, str]:
+        return ("clip_limit", "tile_grid_size")
+
+
+class ChannelShuffle(ImageOnlyTransform):
+    """Randomly rearrange channels of the image.
+
+    Args:
+        p: probability of applying the transform. Default: 0.5.
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    """
+
+    def apply(self, img: np.ndarray, channels_shuffled: tuple[int, ...], **params: Any) -> np.ndarray:
+        return fmain.channel_shuffle(img, channels_shuffled)
+
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        ch_arr = list(range(params["shape"][2]))
+        ch_arr = random_utils.shuffle(ch_arr)
         return {"channels_shuffled": ch_arr}
 
-    def get_transform_init_args_names(self):
+    def get_transform_init_args_names(self) -> tuple[()]:
         return ()
 
 
 class InvertImg(ImageOnlyTransform):
-    """Invert the input image by subtracting pixel values from 255.
+    """Invert the input image by subtracting pixel values from max values of the image types,
+    i.e., 255 for uint8 and 1.0 for float32.
 
     Args:
-        p (float): probability of applying the transform. Default: 0.5.
+        p: probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
-        uint8
+        uint8, float32
+
+    Number of channels:
+        Any
+
     """
 
-    def apply(self, img, **params):
-        return F.invert(img)
+    def apply(self, img: np.ndarray, **params: Any) -> np.ndarray:
+        return fmain.invert(img)
 
-    def get_transform_init_args_names(self):
+    def get_transform_init_args_names(self) -> tuple[()]:
         return ()
 
 
 class RandomGamma(ImageOnlyTransform):
-    """
+    """Applies random gamma correction to the input image.
+
+    Gamma correction, or simply gamma, is a nonlinear operation used to encode and decode luminance
+    or tristimulus values in imaging systems. This transform can adjust the brightness of an image
+    while preserving the relative differences between darker and lighter areas, making it useful
+    for simulating different lighting conditions or correcting for display characteristics.
+
     Args:
-        gamma_limit (float or (float, float)): If gamma_limit is a single float value,
-            the range will be (-gamma_limit, gamma_limit). Default: (80, 120).
-        eps: Deprecated.
+        gamma_limit (float | tuple[float, float]): If gamma_limit is a single float value, the range
+            will be (1, gamma_limit). If it's a tuple of two floats, they will serve as
+            the lower and upper bounds for gamma adjustment. Values are in terms of percentage change,
+            e.g., (80, 120) means the gamma will be between 80% and 120% of the original.
+            Default: (80, 120).
+        eps: A small value added to the gamma to avoid division by zero or log of zero errors.
+            Default: 1e-7.
+        p (float): Probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - The gamma correction is applied using the formula: output = input^gamma
+        - Gamma values > 1 will make the image darker, while values < 1 will make it brighter
+        - This transform is particularly useful for:
+          * Simulating different lighting conditions
+          * Correcting for non-linear display characteristics
+          * Enhancing contrast in certain regions of the image
+          * Data augmentation in computer vision tasks
+
+    Mathematical Formulation:
+        Let I be the input image and G (gamma) be the correction factor.
+        The gamma correction is applied as follows:
+        1. Normalize the image to [0, 1] range: I_norm = I / 255 (for uint8 images)
+        2. Apply gamma correction: I_corrected = I_norm ^ (1 / G)
+        3. Scale back to original range: output = I_corrected * 255 (for uint8 images)
+
+        The actual gamma value used is calculated as:
+        G = 1 + (random_value / 100), where random_value is sampled from gamma_limit range.
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+
+        # Default usage
+        >>> transform = A.RandomGamma(p=1.0)
+        >>> augmented_image = transform(image=image)["image"]
+
+        # Custom gamma range
+        >>> transform = A.RandomGamma(gamma_limit=(50, 150), p=1.0)
+        >>> augmented_image = transform(image=image)["image"]
+
+        # Applying with other transforms
+        >>> transform = A.Compose([
+        ...     A.RandomGamma(gamma_limit=(80, 120), p=0.5),
+        ...     A.RandomBrightnessContrast(p=0.5),
+        ... ])
+        >>> augmented_image = transform(image=image)["image"]
+
+    References:
+        - Gamma correction: https://en.wikipedia.org/wiki/Gamma_correction
+        - Power law (Gamma) encoding: https://www.cambridgeincolour.com/tutorials/gamma-correction.htm
     """
 
-    def __init__(self, gamma_limit=(80, 120), eps=None, always_apply=False, p=0.5):
-        super(RandomGamma, self).__init__(always_apply, p)
-        self.gamma_limit = to_tuple(gamma_limit)
-        self.eps = eps
+    class InitSchema(BaseTransformInitSchema):
+        gamma_limit: OnePlusFloatRangeType
 
-    def apply(self, img, gamma=1, **params):
-        return F.gamma_transform(img, gamma=gamma)
+    def __init__(
+        self,
+        gamma_limit: ScaleFloatType = (80, 120),
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p, always_apply)
+        self.gamma_limit = cast(Tuple[float, float], gamma_limit)
 
-    def get_params(self):
-        return {"gamma": random.randint(self.gamma_limit[0], self.gamma_limit[1]) / 100.0}
+    def apply(self, img: np.ndarray, gamma: float, **params: Any) -> np.ndarray:
+        return fmain.gamma_transform(img, gamma=gamma)
 
-    def get_transform_init_args_names(self):
-        return ("gamma_limit", "eps")
+    def get_params(self) -> dict[str, float]:
+        return {"gamma": random.uniform(self.gamma_limit[0], self.gamma_limit[1]) / 100.0}
+
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return ("gamma_limit",)
 
 
 class ToGray(ImageOnlyTransform):
-    """Convert the input RGB image to grayscale. If the mean pixel value for the resulting image is greater
-    than 127, invert the resulting grayscale image.
+    """Convert an image to grayscale and optionally replicate the grayscale channel.
+
+    This transform first converts a color image to a single-channel grayscale image using various methods,
+    then replicates the grayscale channel if num_output_channels is greater than 1.
 
     Args:
-        p (float): probability of applying the transform. Default: 0.5.
+        num_output_channels (int): The number of channels in the output image. If greater than 1,
+            the grayscale channel will be replicated. Default: 3.
+        method (Literal["weighted_average", "from_lab", "desaturation", "average", "max", "pca"]):
+            The method used for grayscale conversion:
+            - "weighted_average": Uses a weighted sum of RGB channels (0.299R + 0.587G + 0.114B).
+              Works only with 3-channel images. Provides realistic results based on human perception.
+            - "from_lab": Extracts the L channel from the LAB color space.
+              Works only with 3-channel images. Gives perceptually uniform results.
+            - "desaturation": Averages the maximum and minimum values across channels.
+              Works with any number of channels. Fast but may not preserve perceived brightness well.
+            - "average": Simple average of all channels.
+              Works with any number of channels. Fast but may not give realistic results.
+            - "max": Takes the maximum value across all channels.
+              Works with any number of channels. Tends to produce brighter results.
+            - "pca": Applies Principal Component Analysis to reduce channels.
+              Works with any number of channels. Can preserve more information but is computationally intensive.
+        p (float): Probability of applying the transform. Default: 0.5.
+
+    Raises:
+        TypeError: If the input image doesn't have 3 channels for methods that require it.
+
+    Note:
+        - The transform first converts the input image to single-channel grayscale, then replicates
+          this channel if num_output_channels > 1.
+        - "weighted_average" and "from_lab" are typically used in image processing and computer vision
+          applications where accurate representation of human perception is important.
+        - "desaturation" and "average" are often used in simple image manipulation tools or when
+          computational speed is a priority.
+        - "max" method can be useful in scenarios where preserving bright features is important,
+          such as in some medical imaging applications.
+        - "pca" might be used in advanced image analysis tasks or when dealing with hyperspectral images.
+
+    Image types:
+        uint8, float32
+
+    Returns:
+        np.ndarray: Grayscale image with the specified number of channels.
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        num_output_channels: int = Field(default=3, description="The number of output channels.", ge=1)
+        method: Literal["weighted_average", "from_lab", "desaturation", "average", "max", "pca"]
+
+    def __init__(
+        self,
+        num_output_channels: int = 3,
+        method: Literal["weighted_average", "from_lab", "desaturation", "average", "max", "pca"] = "weighted_average",
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.num_output_channels = num_output_channels
+        self.method = method
+
+    def apply(self, img: np.ndarray, **params: Any) -> np.ndarray:
+        if is_grayscale_image(img):
+            warnings.warn("The image is already gray.", stacklevel=2)
+            return img
+
+        num_channels = get_num_channels(img)
+
+        if num_channels != NUM_RGB_CHANNELS and self.method not in {"desaturation", "average", "max", "pca"}:
+            msg = "ToGray transformation expects 3-channel images."
+            raise TypeError(msg)
+
+        return fmain.to_gray(img, self.num_output_channels, self.method)
+
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return "num_output_channels", "method"
+
+
+class ToRGB(ImageOnlyTransform):
+    """Convert the input grayscale image to RGB.
+
+    Args:
+        p: probability of applying the transform. Default: 1.
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
     """
 
-    def apply(self, img, **params):
-        return F.to_gray(img)
+    def __init__(self, p: float = 1.0, always_apply: bool | None = None):
+        super().__init__(p=p, always_apply=always_apply)
 
-    def get_transform_init_args_names(self):
+    def apply(self, img: np.ndarray, **params: Any) -> np.ndarray:
+        if is_rgb_image(img):
+            warnings.warn("The image is already an RGB.", stacklevel=2)
+            return np.ascontiguousarray(img)
+        if not is_grayscale_image(img):
+            msg = "ToRGB transformation expects 2-dim images or 3-dim with the last dimension equal to 1."
+            raise TypeError(msg)
+
+        return fmain.grayscale_to_multichannel(img, num_output_channels=3)
+
+    def get_transform_init_args_names(self) -> tuple[()]:
         return ()
 
 
@@ -2757,25 +2862,29 @@ class ToSepia(ImageOnlyTransform):
     """Applies sepia filter to the input RGB image
 
     Args:
-        p (float): probability of applying the transform. Default: 0.5.
+        p: probability of applying the transform. Default: 0.5.
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
     """
 
-    def __init__(self, always_apply=False, p=0.5):
-        super(ToSepia, self).__init__(always_apply, p)
-        self.sepia_transformation_matrix = np.matrix(
-            [[0.393, 0.769, 0.189], [0.349, 0.686, 0.168], [0.272, 0.534, 0.131]]
+    def __init__(self, p: float = 0.5, always_apply: bool | None = None):
+        super().__init__(p, always_apply)
+        self.sepia_transformation_matrix = np.array(
+            [[0.393, 0.769, 0.189], [0.349, 0.686, 0.168], [0.272, 0.534, 0.131]],
         )
 
-    def apply(self, image, **params):
-        return F.linear_transformation_rgb(image, self.sepia_transformation_matrix)
+    def apply(self, img: np.ndarray, **params: Any) -> np.ndarray:
+        if not is_rgb_image(img):
+            msg = "ToSepia transformation expects 3-channel images."
+            raise TypeError(msg)
+        return fmain.linear_transformation_rgb(img, self.sepia_transformation_matrix)
 
-    def get_transform_init_args_names(self):
+    def get_transform_init_args_names(self) -> tuple[()]:
         return ()
 
 
@@ -2788,8 +2897,8 @@ class ToFloat(ImageOnlyTransform):
         :class:`~albumentations.augmentations.transforms.FromFloat`
 
     Args:
-        max_value (float): maximum possible input value. Default: None.
-        p (float): probability of applying the transform. Default: 1.0.
+        max_value: maximum possible input value. Default: None.
+        p: probability of applying the transform. Default: 1.0.
 
     Targets:
         image
@@ -2799,524 +2908,1999 @@ class ToFloat(ImageOnlyTransform):
 
     """
 
-    def __init__(self, max_value=None, always_apply=False, p=1.0):
-        super(ToFloat, self).__init__(always_apply, p)
+    class InitSchema(BaseTransformInitSchema):
+        max_value: float | None = Field(default=None, description="Maximum possible input value.")
+        p: ProbabilityType = 1
+
+    def __init__(self, max_value: float | None = None, p: float = 1.0, always_apply: bool | None = None):
+        super().__init__(p, always_apply)
         self.max_value = max_value
 
-    def apply(self, img, **params):
-        return F.to_float(img, self.max_value)
+    def apply(self, img: np.ndarray, **params: Any) -> np.ndarray:
+        return to_float(img, self.max_value)
 
-    def get_transform_init_args_names(self):
+    def get_transform_init_args_names(self) -> tuple[str]:
         return ("max_value",)
 
 
 class FromFloat(ImageOnlyTransform):
-    """Take an input array where all values should lie in the range [0, 1.0], multiply them by `max_value` and then
-    cast the resulted value to a type specified by `dtype`. If `max_value` is None the transform will try to infer
-    the maximum value for the data type from the `dtype` argument.
+    """Convert an image from floating point representation to the specified data type.
 
-    This is the inverse transform for :class:`~albumentations.augmentations.transforms.ToFloat`.
+    This transform is designed to convert images from a normalized floating-point representation
+    (typically with values in the range [0, 1]) to other data types, scaling the values appropriately.
 
     Args:
-        max_value (float): maximum possible input value. Default: None.
-        dtype (string or numpy data type): data type of the output. See the `'Data types' page from the NumPy docs`_.
-            Default: 'uint16'.
-        p (float): probability of applying the transform. Default: 1.0.
+        dtype (str): The desired output data type. Supported types include 'uint8', 'uint16',
+                     'uint32'. Default: 'uint8'.
+        max_value (float | None): The maximum value for the output dtype. If None, the transform
+                                  will attempt to infer the maximum value based on the dtype.
+                                  Default: None.
+        p (float): Probability of applying the transform. Default: 1.0.
 
     Targets:
         image
 
     Image types:
-        float32
+        float32, float64
 
-    .. _'Data types' page from the NumPy docs:
-       https://docs.scipy.org/doc/numpy/user/basics.types.html
+    Note:
+        - This is the inverse transform for ToFloat.
+        - Input images are expected to be in floating point format with values in the range [0, 1].
+        - For integer output types (uint8, uint16, uint32), the function will scale the values
+          to the appropriate range (e.g., 0-255 for uint8).
+        - For float output types (float32, float64), the values will remain in the [0, 1] range.
+        - The transform uses the `from_float` function internally, which ensures output values
+          are within the valid range for the specified dtype.
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> transform = A.FromFloat(dtype='uint8', max_value=None, p=1.0)
+        >>> image = np.random.rand(100, 100, 3).astype(np.float32)  # Float image in [0, 1] range
+        >>> result = transform(image=image)
+        >>> uint8_image = result['image']
+        >>> assert uint8_image.dtype == np.uint8
+        >>> assert uint8_image.min() >= 0 and uint8_image.max() <= 255
+
     """
 
-    def __init__(self, dtype="uint16", max_value=None, always_apply=False, p=1.0):
-        super(FromFloat, self).__init__(always_apply, p)
+    class InitSchema(BaseTransformInitSchema):
+        dtype: Literal["uint8", "uint16", "float32", "float64"]
+        max_value: float | None
+        p: ProbabilityType = 1
+
+    def __init__(
+        self,
+        dtype: Literal["uint8", "uint16", "float32", "float64"] = "uint8",
+        max_value: float | None = None,
+        always_apply: bool | None = None,
+        p: float = 1.0,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
         self.dtype = np.dtype(dtype)
         self.max_value = max_value
 
-    def apply(self, img, **params):
-        return F.from_float(img, self.dtype, self.max_value)
+    def apply(self, img: np.ndarray, **params: Any) -> np.ndarray:
+        return from_float(img, self.dtype, self.max_value)
 
-    def get_transform_init_args(self):
+    def get_transform_init_args(self) -> dict[str, Any]:
         return {"dtype": self.dtype.name, "max_value": self.max_value}
 
 
+class InterpolationDict(TypedDict):
+    upscale: int
+    downscale: int
+
+
+class InterpolationPydantic(BaseModel):
+    upscale: InterpolationType
+    downscale: InterpolationType
+
+
 class Downscale(ImageOnlyTransform):
-    """Decreases image quality by downscaling and upscaling back.
+    """Decrease image quality by downscaling and upscaling back.
+
+    This transform simulates the effect of a low-resolution image by first downscaling
+    the image to a lower resolution and then upscaling it back to its original size.
+    This process introduces loss of detail and can be used to simulate low-quality
+    images or to test the robustness of models to different image resolutions.
 
     Args:
-        scale_min (float): lower bound on the image scale. Should be < 1.
-        scale_max (float):  lower bound on the image scale. Should be .
-        interpolation: cv2 interpolation method. cv2.INTER_NEAREST by default
+        scale_range (tuple[float, float]): Range for the downscaling factor.
+            Should be two float values between 0 and 1, where the first value is less than or equal to the second.
+            The actual downscaling factor will be randomly chosen from this range for each image.
+            Lower values result in more aggressive downscaling.
+            Default: (0.25, 0.25)
+
+        interpolation_pair (InterpolationDict): A dictionary specifying the interpolation methods to use for
+            downscaling and upscaling. Should contain two keys:
+            - 'downscale': Interpolation method for downscaling
+            - 'upscale': Interpolation method for upscaling
+            Values should be OpenCV interpolation flags (e.g., cv2.INTER_NEAREST, cv2.INTER_LINEAR, etc.)
+            Default: {'downscale': cv2.INTER_NEAREST, 'upscale': cv2.INTER_NEAREST}
+
+        p (float): Probability of applying the transform. Should be in the range [0, 1].
+            Default: 0.5
 
     Targets:
         image
 
     Image types:
         uint8, float32
+
+    Note:
+        - The actual downscaling factor is randomly chosen for each image from the range
+          specified in scale_range.
+        - Using different interpolation methods for downscaling and upscaling can produce
+          various effects. For example, using INTER_NEAREST for both can create a pixelated look,
+          while using INTER_LINEAR or INTER_CUBIC can produce smoother results.
+        - This transform can be useful for data augmentation, especially when training models
+          that need to be robust to variations in image quality or resolution.
+
+    Example:
+        >>> import albumentations as A
+        >>> import cv2
+        >>> transform = A.Downscale(
+        ...     scale_range=(0.5, 0.75),
+        ...     interpolation_pair={'downscale': cv2.INTER_NEAREST, 'upscale': cv2.INTER_LINEAR},
+        ...     p=0.5
+        ... )
+        >>> transformed = transform(image=image)
+        >>> downscaled_image = transformed['image']
     """
 
-    def __init__(self, scale_min=0.25, scale_max=0.25, interpolation=cv2.INTER_NEAREST, always_apply=False, p=0.5):
-        super(Downscale, self).__init__(always_apply, p)
-        assert scale_min <= scale_max, "Expected scale_min be less or equal scale_max, got {} {}".format(
-            scale_min, scale_max
+    class InitSchema(BaseTransformInitSchema):
+        scale_min: float | None
+        scale_max: float | None
+
+        interpolation: int | Interpolation | InterpolationDict | None = Field(
+            default_factory=lambda: Interpolation(downscale=cv2.INTER_NEAREST, upscale=cv2.INTER_NEAREST),
         )
-        assert scale_max < 1, "Expected scale_max to be less than 1, got {}".format(scale_max)
-        self.scale_min = scale_min
-        self.scale_max = scale_max
-        self.interpolation = interpolation
+        interpolation_pair: InterpolationPydantic
 
-    def apply(self, image, scale, interpolation, **params):
-        return F.downscale(image, scale=scale, interpolation=interpolation)
+        scale_range: Annotated[tuple[float, float], AfterValidator(check_01), AfterValidator(nondecreasing)]
 
-    def get_params(self):
-        return {"scale": np.random.uniform(self.scale_min, self.scale_max), "interpolation": self.interpolation}
+        @model_validator(mode="after")
+        def validate_params(self) -> Self:
+            if self.scale_min is not None and self.scale_max is not None:
+                warn(
+                    "scale_min and scale_max are deprecated. Use scale_range instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
 
-    def get_transform_init_args_names(self):
-        return "scale_min", "scale_max", "interpolation"
+                self.scale_range = (self.scale_min, self.scale_max)
+                self.scale_min = None
+                self.scale_max = None
+
+            if self.interpolation is not None:
+                warn(
+                    "Downscale.interpolation is deprecated. Use Downscale.interpolation_pair instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+
+                if isinstance(self.interpolation, dict):
+                    self.interpolation_pair = InterpolationPydantic(**self.interpolation)
+                elif isinstance(self.interpolation, int):
+                    self.interpolation_pair = InterpolationPydantic(
+                        upscale=self.interpolation,
+                        downscale=self.interpolation,
+                    )
+                elif isinstance(self.interpolation, Interpolation):
+                    self.interpolation_pair = InterpolationPydantic(
+                        upscale=self.interpolation.upscale,
+                        downscale=self.interpolation.downscale,
+                    )
+                self.interpolation = None
+
+            return self
+
+    def __init__(
+        self,
+        scale_min: float | None = None,
+        scale_max: float | None = None,
+        interpolation: int | Interpolation | InterpolationDict | None = None,
+        scale_range: tuple[float, float] = (0.25, 0.25),
+        interpolation_pair: InterpolationDict = InterpolationDict(
+            {"upscale": cv2.INTER_NEAREST, "downscale": cv2.INTER_NEAREST},
+        ),
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.scale_range = scale_range
+        self.interpolation_pair = interpolation_pair
+
+    def apply(self, img: np.ndarray, scale: float, **params: Any) -> np.ndarray:
+        return fmain.downscale(
+            img,
+            scale=scale,
+            down_interpolation=self.interpolation_pair["downscale"],
+            up_interpolation=self.interpolation_pair["upscale"],
+        )
+
+    def get_params(self) -> dict[str, Any]:
+        return {"scale": random.uniform(*self.scale_range)}
+
+    def get_transform_init_args_names(self) -> tuple[str, str]:
+        return "scale_range", "interpolation_pair"
 
 
 class Lambda(NoOp):
     """A flexible transformation class for using user-defined transformation functions per targets.
-    Function signature must include **kwargs to accept optinal arguments like interpolation method, image size, etc:
+    Function signature must include **kwargs to accept optional arguments like interpolation method, image size, etc:
 
     Args:
-        image (callable): Image transformation function.
-        mask (callable): Mask transformation function.
-        keypoint (callable): Keypoint transformation function.
-        bbox (callable): BBox transformation function.
-        always_apply (bool): Indicates whether this transformation should be always applied.
-        p (float): probability of applying the transform. Default: 1.0.
+        image: Image transformation function.
+        mask: Mask transformation function.
+        keypoint: Keypoint transformation function.
+        bbox: BBox transformation function.
+        global_label: Global label transformation function.
+        p: probability of applying the transform. Default: 1.0.
 
     Targets:
-        image, mask, bboxes, keypoints
+        image, mask, bboxes, keypoints, global_label
 
     Image types:
         Any
 
-    """
-
-    def __init__(self, image=None, mask=None, keypoint=None, bbox=None, name=None, always_apply=False, p=1.0):
-        super(Lambda, self).__init__(always_apply, p)
-
-        self.name = name
-        self.custom_apply_fns = {target_name: F.noop for target_name in ("image", "mask", "keypoint", "bbox")}
-        for target_name, custom_apply_fn in {"image": image, "mask": mask, "keypoint": keypoint, "bbox": bbox}.items():
-            if custom_apply_fn is not None:
-                if isinstance(custom_apply_fn, LambdaType) and custom_apply_fn.__name__ == "<lambda>":
-                    warnings.warn(
-                        "Using lambda is incompatible with multiprocessing. "
-                        "Consider using regular functions or partial()."
-                    )
-
-                self.custom_apply_fns[target_name] = custom_apply_fn
-
-    def apply(self, img, **params):
-        fn = self.custom_apply_fns["image"]
-        return fn(img, **params)
-
-    def apply_to_mask(self, mask, **params):
-        fn = self.custom_apply_fns["mask"]
-        return fn(mask, **params)
-
-    def apply_to_bbox(self, bbox, **params):
-        fn = self.custom_apply_fns["bbox"]
-        return fn(bbox, **params)
-
-    def apply_to_keypoint(self, keypoint, **params):
-        fn = self.custom_apply_fns["keypoint"]
-        return fn(keypoint, **params)
-
-    def _to_dict(self):
-        if self.name is None:
-            raise ValueError(
-                "To make a Lambda transform serializable you should provide the `name` argument, "
-                "e.g. `Lambda(name='my_transform', image=<some func>, ...)`."
-            )
-        return {"__type__": "Lambda", "__name__": self.name}
-
-    def __repr__(self):
-        state = {"name": self.name}
-        state.update(self.custom_apply_fns.items())
-        state.update(self.get_base_init_args())
-        return "{name}({args})".format(name=self.__class__.__name__, args=format_args(state))
-
-
-class MultiplicativeNoise(ImageOnlyTransform):
-    """Multiply image to random number or array of numbers.
-
-    Args:
-        multiplier (float or tuple of floats): If single float image will be multiplied to this number.
-            If tuple of float multiplier will be in range `[multiplier[0], multiplier[1])`. Default: (0.9, 1.1).
-        per_channel (bool): If `False`, same values for all channels will be used.
-            If `True` use sample values for each channels. Default False.
-        elementwise (bool): If `False` multiply multiply all pixels in an image with a random value sampled once.
-            If `True` Multiply image pixels with values that are pixelwise randomly sampled. Defaule: False.
-
-    Targets:
-        image
-
-    Image types:
-        Any
-    """
-
-    def __init__(self, multiplier=(0.9, 1.1), per_channel=False, elementwise=False, always_apply=False, p=0.5):
-        super(MultiplicativeNoise, self).__init__(always_apply, p)
-        self.multiplier = to_tuple(multiplier, multiplier)
-        self.per_channel = per_channel
-        self.elementwise = elementwise
-
-    def apply(self, img, multiplier=np.array([1]), **kwargs):
-        return F.multiply(img, multiplier)
-
-    def get_params_dependent_on_targets(self, params):
-        if self.multiplier[0] == self.multiplier[1]:
-            return {"multiplier": np.array([self.multiplier[0]])}
-
-        img = params["image"]
-
-        h, w = img.shape[:2]
-
-        if self.per_channel:
-            c = 1 if F.is_grayscale_image(img) else img.shape[-1]
-        else:
-            c = 1
-
-        if self.elementwise:
-            shape = [h, w, c]
-        else:
-            shape = [c]
-
-        multiplier = np.random.uniform(self.multiplier[0], self.multiplier[1], shape)
-        if F.is_grayscale_image(img):
-            multiplier = np.squeeze(multiplier)
-
-        return {"multiplier": multiplier}
-
-    @property
-    def targets_as_params(self):
-        return ["image"]
-
-    def get_transform_init_args_names(self):
-        return "multiplier", "per_channel", "elementwise"
-
-
-class FancyPCA(ImageOnlyTransform):
-    """Augment RGB image using FancyPCA from Krizhevsky's paper
-    "ImageNet Classification with Deep Convolutional Neural Networks"
-
-    Args:
-        alpha (float):  how much to perturb/scale the eigen vecs and vals.
-            scale is samples from gaussian distribution (mu=0, sigma=alpha)
-
-    Targets:
-        image
-
-    Image types:
-        3-channel uint8 images only
-
-    Credit:
-        http://papers.nips.cc/paper/4824-imagenet-classification-with-deep-convolutional-neural-networks.pdf
-        https://deshanadesai.github.io/notes/Fancy-PCA-with-Scikit-Image
-        https://pixelatedbrian.github.io/2018-04-29-fancy_pca/
-    """
-
-    def __init__(self, alpha=0.1, always_apply=False, p=0.5):
-        """
-
-        """
-        super(FancyPCA, self).__init__(always_apply=always_apply, p=p)
-        self.alpha = alpha
-
-    def apply(self, img, alpha=0.1, **params):
-        img = F.fancy_pca(img, alpha)
-        return img
-
-    def get_params(self):
-        return {"alpha": random.gauss(0, self.alpha)}
-
-    def get_transform_init_args_names(self):
-        return ("alpha",)
-
-
-class MaskDropout(DualTransform):
-    """
-    Image & mask augmentation that zero out mask and image regions corresponding
-    to randomly chosen object instance from mask.
-
-    Mask must be single-channel image, zero values treated as background.
-    Image can be any number of channels.
-
-    Inspired by https://www.kaggle.com/c/severstal-steel-defect-detection/discussion/114254
-    """
-
-    def __init__(self, max_objects=1, image_fill_value=0, mask_fill_value=0, always_apply=False, p=0.5):
-        """
-        Args:
-            max_objects: Maximum number of labels that can be zeroed out. Can be tuple, in this case it's [min, max]
-            image_fill_value: Fill value to use when filling image.
-                Can be 'inpaint' to apply inpaining (works only  for 3-chahnel images)
-            mask_fill_value: Fill value to use when filling mask.
-
-        Targets:
-            image, mask
-
-        Image types:
-            uint8, float32
-        """
-        super(MaskDropout, self).__init__(always_apply, p)
-        self.max_objects = to_tuple(max_objects, 1)
-        self.image_fill_value = image_fill_value
-        self.mask_fill_value = mask_fill_value
-
-    @property
-    def targets_as_params(self):
-        return ["mask"]
-
-    def get_params_dependent_on_targets(self, params):
-        mask = params["mask"]
-
-        label_image, num_labels = label(mask, return_num=True)
-
-        if num_labels == 0:
-            dropout_mask = None
-        else:
-            objects_to_drop = random.randint(self.max_objects[0], self.max_objects[1])
-            objects_to_drop = min(num_labels, objects_to_drop)
-
-            if objects_to_drop == num_labels:
-                dropout_mask = mask > 0
-            else:
-                labels_index = random.sample(range(1, num_labels + 1), objects_to_drop)
-                dropout_mask = np.zeros((mask.shape[0], mask.shape[1]), dtype=np.bool)
-                for label_index in labels_index:
-                    dropout_mask |= label_image == label_index
-
-        params.update({"dropout_mask": dropout_mask})
-        return params
-
-    def apply(self, img, dropout_mask=None, **params):
-        if dropout_mask is None:
-            return img
-
-        if self.image_fill_value == "inpaint":
-            dropout_mask = dropout_mask.astype(np.uint8)
-            _, _, w, h = cv2.boundingRect(dropout_mask)
-            radius = min(3, max(w, h) // 2)
-            img = cv2.inpaint(img, dropout_mask, radius, cv2.INPAINT_NS)
-        else:
-            img = img.copy()
-            img[dropout_mask] = self.image_fill_value
-
-        return img
-
-    def apply_to_mask(self, img, dropout_mask=None, **params):
-        if dropout_mask is None:
-            return img
-
-        img = img.copy()
-        img[dropout_mask] = self.mask_fill_value
-        return img
-
-    def get_transform_init_args_names(self):
-        return ("max_objects", "image_fill_value", "mask_fill_value")
-
-
-class GlassBlur(Blur):
-    """Apply glass noise to the input image.
-    Args:
-        sigma (float): standard deviation for Gaussian kernel.
-        max_delta (int): max distance between pixels which are swapped.
-        iterations (int): number of repeats.
-            Should be in range [1, inf). Default: (2).
-        mode (str): mode of computation: fast or exact. Default: "fast".
-        p (float): probability of applying the transform. Default: 0.5.
-    Targets:
-        image
-    Image types:
-        uint8, float32
-
-    Reference:
-    |  https://arxiv.org/abs/1903.12261
-    |  https://github.com/hendrycks/robustness/blob/master/ImageNet-C/create_c/make_imagenet_c.py
-    """
-
-    def __init__(self, sigma=0.7, max_delta=4, iterations=2, always_apply=False, mode="fast", p=0.5):
-        super(GlassBlur, self).__init__(always_apply=always_apply, p=p)
-        if iterations < 1:
-            raise ValueError("Iterations should be more or equal to 1, but we got {}".format(iterations))
-
-        if mode not in ["fast", "exact"]:
-            raise ValueError("Mode should be 'fast' or 'exact', but we got {}".format(iterations))
-
-        self.sigma = sigma
-        self.max_delta = max_delta
-        self.iterations = iterations
-        self.mode = mode
-
-    def apply(self, img, sigma=0.7, max_delta=4, iterations=2, dxy=0, **params):
-        return F.glass_blur(img, self.sigma, self.max_delta, self.iterations, dxy, self.mode)
-
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-
-        # generate array containing all necessary values for transformations
-        width_pixels = img.shape[0] - self.max_delta * 2
-        height_pixels = img.shape[1] - self.max_delta * 2
-        total_pixels = width_pixels * height_pixels
-        dxy = np.random.randint(-self.max_delta, self.max_delta, size=(total_pixels, self.iterations, 2))
-
-        return {"dxy": dxy}
-
-    def get_transform_init_args_names(self):
-        return ("sigma", "max_delta", "iterations")
-
-    @property
-    def targets_as_params(self):
-        return ["image"]
-
-
-class GridDropout(DualTransform):
-    """
-    GridDropout, drops out rectangular regions of an image and the corresponding mask in a grid fashion.
-
-        Args:
-            ratio (float): the ratio of the mask holes to the unit_size (same for horizontal and vertical directions).
-                Must be between 0 and 1. Default: 0.5.
-            unit_size_min (int): minimum size of the grid unit. Must be between 2 and the image shorter edge.
-                If 'None', holes_number_x and holes_number_y are used to setup the grid. Default: `None`.
-            unit_size_max (int): maximum size of the grid unit. Must be between 2 and the image shorter edge.
-                If 'None', holes_number_x and holes_number_y are used to setup the grid. Default: `None`.
-            holes_number_x (int): the number of grid units in x direction. Must be between 1 and image width//2.
-                If 'None', grid unit width is set as image_width//10. Default: `None`.
-            holes_number_y (int): the number of grid units in y direction. Must be between 1 and image height//2.
-                If `None`, grid unit height is set equal to the grid unit width or image height, whatever is smaller.
-            shift_x (int): offsets of the grid start in x direction from (0,0) coordinate.
-                Clipped between 0 and grid unit_width - hole_width. Default: 0.
-            shift_y (int): offsets of the grid start in y direction from (0,0) coordinate.
-                Clipped between 0 and grid unit height - hole_height. Default: 0.
-            random_offset (boolean): weather to offset the grid randomly between 0 and grid unit size - hole size
-                If 'True', entered shift_x, shift_y are ignored and set randomly. Default: `False`.
-            fill_value (int): value for the dropped pixels. Default = 0
-            mask_fill_value (int): value for the dropped pixels in mask.
-                If `None`, tranformation is not applied to the mask. Default: `None`.
-        Targets:
-            image, mask
-        Image types:
-            uint8, float32
-        References:
-            https://arxiv.org/abs/2001.04086
     """
 
     def __init__(
         self,
-        ratio: float = 0.5,
-        unit_size_min: int = None,
-        unit_size_max: int = None,
-        holes_number_x: int = None,
-        holes_number_y: int = None,
-        shift_x: int = 0,
-        shift_y: int = 0,
-        random_offset: bool = False,
-        fill_value: int = 0,
-        mask_fill_value: int = None,
-        always_apply: bool = False,
+        image: Callable[..., Any] | None = None,
+        mask: Callable[..., Any] | None = None,
+        keypoints: Callable[..., Any] | None = None,
+        bboxes: Callable[..., Any] | None = None,
+        global_label: Callable[..., Any] | None = None,
+        name: str | None = None,
+        always_apply: bool | None = None,
+        p: float = 1.0,
+    ):
+        super().__init__(p, always_apply)
+
+        self.name = name
+        self.custom_apply_fns = {
+            target_name: fmain.noop for target_name in ("image", "mask", "keypoints", "bboxes", "global_label")
+        }
+        for target_name, custom_apply_fn in {
+            "image": image,
+            "mask": mask,
+            "keypoints": keypoints,
+            "bboxes": bboxes,
+            "global_label": global_label,
+        }.items():
+            if custom_apply_fn is not None:
+                if isinstance(custom_apply_fn, LambdaType) and custom_apply_fn.__name__ == "<lambda>":
+                    warnings.warn(
+                        "Using lambda is incompatible with multiprocessing. "
+                        "Consider using regular functions or partial().",
+                        stacklevel=2,
+                    )
+
+                self.custom_apply_fns[target_name] = custom_apply_fn
+
+    def apply(self, img: np.ndarray, **params: Any) -> np.ndarray:
+        fn = self.custom_apply_fns["image"]
+        return fn(img, **params)
+
+    def apply_to_mask(self, mask: np.ndarray, **params: Any) -> np.ndarray:
+        fn = self.custom_apply_fns["mask"]
+        return fn(mask, **params)
+
+    def apply_to_bboxes(self, bboxes: np.ndarray, **params: Any) -> np.ndarray:
+        is_ndarray = True
+
+        if not isinstance(bboxes, np.ndarray):
+            is_ndarray = False
+            bboxes = np.array(bboxes, dtype=np.float32)
+
+        fn = self.custom_apply_fns["bboxes"]
+        result = fn(bboxes, **params)
+
+        if not is_ndarray:
+            return result.tolist()
+
+        return result
+
+    def apply_to_keypoints(self, keypoints: np.ndarray, **params: Any) -> np.ndarray:
+        is_ndarray = True
+        if not isinstance(keypoints, np.ndarray):
+            is_ndarray = False
+            keypoints = np.array(keypoints, dtype=np.float32)
+
+        fn = self.custom_apply_fns["keypoints"]
+        result = fn(keypoints, **params)
+
+        if not is_ndarray:
+            return result.tolist()
+
+        return result
+
+    def apply_to_global_label(self, label: np.ndarray, **params: Any) -> np.ndarray:
+        fn = self.custom_apply_fns["global_label"]
+        return fn(label, **params)
+
+    @classmethod
+    def is_serializable(cls) -> bool:
+        return False
+
+    def to_dict_private(self) -> dict[str, Any]:
+        if self.name is None:
+            msg = (
+                "To make a Lambda transform serializable you should provide the `name` argument, "
+                "e.g. `Lambda(name='my_transform', image=<some func>, ...)`."
+            )
+            raise ValueError(msg)
+        return {"__class_fullname__": self.get_class_fullname(), "__name__": self.name}
+
+    def __repr__(self) -> str:
+        state = {"name": self.name}
+        state.update(self.custom_apply_fns.items())  # type: ignore[arg-type]
+        state.update(self.get_base_init_args())
+        return f"{self.__class__.__name__}({format_args(state)})"
+
+
+class MultiplicativeNoise(ImageOnlyTransform):
+    """Apply multiplicative noise to the input image.
+
+    This transform multiplies each pixel in the image by a random value or array of values,
+    effectively creating a noise pattern that scales with the image intensity.
+
+    Args:
+        multiplier (tuple[float, float]): The range for the random multiplier.
+            Defines the range from which the multiplier is sampled.
+            Default: (0.9, 1.1)
+
+        per_channel (bool): If True, use a different random multiplier for each channel.
+            If False, use the same multiplier for all channels.
+            Setting this to False is slightly faster.
+            Default: False
+
+        elementwise (bool): If True, generates a unique multiplier for each pixel.
+            If False, generates a single multiplier (or one per channel if per_channel=True).
+            Default: False
+
+        p (float): Probability of applying the transform. Default: 0.5
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - When elementwise=False and per_channel=False, a single multiplier is applied to the entire image.
+        - When elementwise=False and per_channel=True, each channel gets a different multiplier.
+        - When elementwise=True and per_channel=False, each pixel gets the same multiplier across all channels.
+        - When elementwise=True and per_channel=True, each pixel in each channel gets a unique multiplier.
+        - Setting per_channel=False is slightly faster, especially for larger images.
+        - This transform can be used to simulate various lighting conditions or to create noise that
+          scales with image intensity.
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>> transform = A.MultiplicativeNoise(multiplier=(0.9, 1.1), per_channel=True, p=1.0)
+        >>> result = transform(image=image)
+        >>> noisy_image = result["image"]
+
+    References:
+        - Multiplicative noise: https://en.wikipedia.org/wiki/Multiplicative_noise
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        multiplier: Annotated[tuple[float, float], AfterValidator(check_0plus), AfterValidator(nondecreasing)]
+        per_channel: bool
+        elementwise: bool
+
+    def __init__(
+        self,
+        multiplier: ScaleFloatType = (0.9, 1.1),
+        per_channel: bool = False,
+        elementwise: bool = False,
+        always_apply: bool | None = None,
         p: float = 0.5,
     ):
-        super(GridDropout, self).__init__(always_apply, p)
-        self.ratio = ratio
-        self.unit_size_min = unit_size_min
-        self.unit_size_max = unit_size_max
-        self.holes_number_x = holes_number_x
-        self.holes_number_y = holes_number_y
-        self.shift_x = shift_x
-        self.shift_y = shift_y
-        self.random_offset = random_offset
-        self.fill_value = fill_value
-        self.mask_fill_value = mask_fill_value
-        if not 0 < self.ratio <= 1:
-            raise ValueError("ratio must be between 0 and 1.")
+        super().__init__(p=p, always_apply=always_apply)
+        self.multiplier = cast(Tuple[float, float], multiplier)
+        self.elementwise = elementwise
+        self.per_channel = per_channel
 
-    def apply(self, image, holes=[], **params):
-        return F.cutout(image, holes, self.fill_value)
+    def apply(
+        self,
+        img: np.ndarray,
+        multiplier: float | np.ndarray,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        return multiply(img, multiplier)
 
-    def apply_to_mask(self, image, holes=[], **params):
-        if self.mask_fill_value is None:
-            return image
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        img = data["image"] if "image" in data else data["images"][0]
+        num_channels = get_num_channels(img)
+
+        if self.elementwise:
+            shape = img.shape if self.per_channel else (*img.shape[:2], 1)
         else:
-            return F.cutout(image, holes, self.mask_fill_value)
+            shape = (num_channels,) if self.per_channel else (1,)
 
-    def get_params_dependent_on_targets(self, params):
-        img = params["image"]
-        height, width = img.shape[:2]
-        # set grid using unit size limits
-        if self.unit_size_min and self.unit_size_max:
-            if not 2 <= self.unit_size_min <= self.unit_size_max:
-                raise ValueError("Max unit size should be >= min size, both at least 2 pixels.")
-            if self.unit_size_max > min(height, width):
-                raise ValueError("Grid size limits must be within the shortest image edge.")
-            unit_width = random.randint(self.unit_size_min, self.unit_size_max + 1)
-            unit_height = unit_width
-        else:
-            # set grid using holes numbers
-            if self.holes_number_x is None:
-                unit_width = max(2, width // 10)
+        multiplier = random_utils.uniform(self.multiplier[0], self.multiplier[1], shape).astype(np.float32)
+
+        if not self.per_channel and num_channels > 1:
+            # Replicate the multiplier for all channels if not per_channel
+            multiplier = np.repeat(multiplier, num_channels, axis=-1)
+
+        if not self.elementwise and self.per_channel:
+            # Reshape to broadcast correctly when not elementwise but per_channel
+            multiplier = multiplier.reshape(1, 1, -1)
+
+        if multiplier.shape != img.shape:
+            multiplier = multiplier.squeeze()
+
+        return {"multiplier": multiplier}
+
+    def get_transform_init_args_names(self) -> tuple[str, str, str]:
+        return "multiplier", "elementwise", "per_channel"
+
+
+class FancyPCA(ImageOnlyTransform):
+    """Apply Fancy PCA augmentation to the input image.
+
+    This augmentation technique applies PCA (Principal Component Analysis) to the image's color channels,
+    then adds multiples of the principal components to the image, with magnitudes proportional to the
+    corresponding eigenvalues times a random variable drawn from a Gaussian with mean 0 and standard
+    deviation 'alpha'.
+
+    Args:
+        alpha (float or tuple of float): Standard deviation of the Gaussian distribution used to generate
+            random noise for each principal component. If a single float is provided, it will be used for
+            all channels. If a tuple of two floats (min, max) is provided, the standard deviation will be
+            uniformly sampled from this range for each run. Default: 0.1.
+        always_apply (bool): If True, the transform will always be applied. Default: False.
+        p (float): Probability of applying the transform. Default: 0.5.
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Number of channels:
+        any
+
+    Note:
+        - This augmentation is particularly effective for RGB images but can work with any number of channels.
+        - For grayscale images, it applies a simplified version of the augmentation.
+        - The transform preserves the mean of the image while adjusting the color/intensity variation.
+        - This implementation is based on the paper by Krizhevsky et al. and is similar to the one used
+          in the original AlexNet paper.
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>> transform = A.FancyPCA(alpha=0.1, p=1.0)
+        >>> result = transform(image=image)
+        >>> augmented_image = result["image"]
+
+    References:
+        - Krizhevsky, A., Sutskever, I., & Hinton, G. E. (2012). ImageNet classification with deep
+          convolutional neural networks. In Advances in neural information processing systems (pp. 1097-1105).
+        - https://papers.nips.cc/paper/4824-imagenet-classification-with-deep-convolutional-neural-networks.pdf
+
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        alpha: float = Field(ge=0)
+
+    def __init__(self, alpha: float = 0.1, p: float = 0.5, always_apply: bool | None = None):
+        super().__init__(p=p, always_apply=always_apply)
+        self.alpha = alpha
+
+    def apply(self, img: np.ndarray, alpha_vector: np.ndarray, **params: Any) -> np.ndarray:
+        return fmain.fancy_pca(img, alpha_vector)
+
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        shape = params["shape"]
+        num_channels = shape[-1] if len(shape) == NUM_MULTI_CHANNEL_DIMENSIONS else 1
+        alpha_vector = random_utils.normal(0, self.alpha, num_channels).astype(np.float32)
+        return {"alpha_vector": alpha_vector}
+
+    def get_transform_init_args_names(self) -> tuple[str]:
+        return ("alpha",)
+
+
+class ColorJitter(ImageOnlyTransform):
+    """Randomly changes the brightness, contrast, saturation, and hue of an image.
+
+    This transform is similar to torchvision's ColorJitter but with some differences due to the use of OpenCV
+    instead of Pillow. The main differences are:
+    1. OpenCV and Pillow use different formulas to convert images to HSV format.
+    2. This implementation uses value saturation instead of uint8 overflow as in Pillow.
+
+    These differences may result in slightly different output compared to torchvision's ColorJitter.
+
+    Args:
+        brightness (tuple[float, float] | float): How much to jitter brightness.
+            If float:
+                The brightness factor is chosen uniformly from [max(0, 1 - brightness), 1 + brightness].
+            If tuple:
+                The brightness factor is sampled from the range specified.
+            Should be non-negative numbers.
+            Default: (0.8, 1.2)
+
+        contrast (tuple[float, float] | float): How much to jitter contrast.
+            If float:
+                The contrast factor is chosen uniformly from [max(0, 1 - contrast), 1 + contrast].
+            If tuple:
+                The contrast factor is sampled from the range specified.
+            Should be non-negative numbers.
+            Default: (0.8, 1.2)
+
+        saturation (tuple[float, float] | float): How much to jitter saturation.
+            If float:
+                The saturation factor is chosen uniformly from [max(0, 1 - saturation), 1 + saturation].
+            If tuple:
+                The saturation factor is sampled from the range specified.
+            Should be non-negative numbers.
+            Default: (0.8, 1.2)
+
+        hue (float or tuple of float (min, max)): How much to jitter hue.
+            If float:
+                The hue factor is chosen uniformly from [-hue, hue]. Should have 0 <= hue <= 0.5.
+            If tuple:
+                The hue factor is sampled from the range specified. Values should be in range [-0.5, 0.5].
+            Default: (-0.5, 0.5)
+
+         p (float): Probability of applying the transform. Should be in the range [0, 1].
+            Default: 0.5
+
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Note:
+        - The order of application for these color transformations is random for each image.
+        - The ranges for brightness, contrast, and saturation are applied as multiplicative factors.
+        - The range for hue is applied as an additive factor.
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>> transform = A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=1.0)
+        >>> result = transform(image=image)
+        >>> jittered_image = result['image']
+
+    References:
+        - https://pytorch.org/vision/stable/transforms.html#torchvision.transforms.ColorJitter
+        - https://docs.opencv.org/3.4/de/d25/imgproc_color_conversions.html
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        brightness: ScaleFloatType
+        contrast: ScaleFloatType
+        saturation: ScaleFloatType
+        hue: ScaleFloatType
+
+        @field_validator("brightness", "contrast", "saturation", "hue")
+        @classmethod
+        def check_ranges(cls, value: ScaleFloatType, info: ValidationInfo) -> tuple[float, float]:
+            if info.field_name == "hue":
+                bounds = -0.5, 0.5
+                bias = 0
+                clip = False
+            elif info.field_name in ["brightness", "contrast", "saturation"]:
+                bounds = 0, float("inf")
+                bias = 1
+                clip = True
+
+            if isinstance(value, numbers.Number):
+                if value < 0:
+                    raise ValueError(f"If {info.field_name} is a single number, it must be non negative.")
+                left = bias - value
+                if clip:
+                    left = max(left, 0)
+                value = (left, bias + value)
+            elif isinstance(value, tuple) and len(value) == PAIR:
+                check_range(value, *bounds, info.field_name)
+
+            return cast(Tuple[float, float], value)
+
+    def __init__(
+        self,
+        brightness: ScaleFloatType = (0.8, 1.2),
+        contrast: ScaleFloatType = (0.8, 1.2),
+        saturation: ScaleFloatType = (0.8, 1.2),
+        hue: ScaleFloatType = (-0.5, 0.5),
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+
+        self.brightness = cast(Tuple[float, float], brightness)
+        self.contrast = cast(Tuple[float, float], contrast)
+        self.saturation = cast(Tuple[float, float], saturation)
+        self.hue = cast(Tuple[float, float], hue)
+
+        self.transforms = [
+            fmain.adjust_brightness_torchvision,
+            fmain.adjust_contrast_torchvision,
+            fmain.adjust_saturation_torchvision,
+            fmain.adjust_hue_torchvision,
+        ]
+
+    def get_params(self) -> dict[str, Any]:
+        brightness = random.uniform(*self.brightness)
+        contrast = random.uniform(*self.contrast)
+        saturation = random.uniform(*self.saturation)
+        hue = random.uniform(*self.hue)
+
+        order = [0, 1, 2, 3]
+        order = random_utils.shuffle(order)
+
+        return {
+            "brightness": brightness,
+            "contrast": contrast,
+            "saturation": saturation,
+            "hue": hue,
+            "order": order,
+        }
+
+    def apply(
+        self,
+        img: np.ndarray,
+        brightness: float,
+        contrast: float,
+        saturation: float,
+        hue: float,
+        order: list[int],
+        **params: Any,
+    ) -> np.ndarray:
+        if order is None:
+            order = [0, 1, 2, 3]
+        if not is_rgb_image(img) and not is_grayscale_image(img):
+            msg = "ColorJitter transformation expects 1-channel or 3-channel images."
+            raise TypeError(msg)
+        color_transforms = [brightness, contrast, saturation, hue]
+        for i in order:
+            img = self.transforms[i](img, color_transforms[i])
+        return img
+
+    def get_transform_init_args_names(self) -> tuple[str, str, str, str]:
+        return "brightness", "contrast", "saturation", "hue"
+
+
+class Sharpen(ImageOnlyTransform):
+    """Sharpen the input image and overlays the result with the original image.
+
+    This transform applies a sharpening filter to the input image and then blends
+    the sharpened image with the original using a specified alpha value.
+
+    Args:
+        alpha (tuple of float): Range to choose the visibility of the sharpened image.
+            At 0, only the original image is visible, at 1.0 only its sharpened version is visible.
+            Values should be in the range [0, 1].
+            Default: (0.2, 0.5).
+
+        lightness (tuple of float): Range to choose the lightness of the sharpened image.
+            Larger values will create images with higher contrast.
+            Values should be greater than 0.
+            Default: (0.5, 1.0).
+
+        p (float): Probability of applying the transform. Default: 0.5.
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - The sharpening effect is achieved using a 3x3 sharpening kernel.
+        - The kernel is dynamically generated based on the 'alpha' and 'lightness' parameters.
+        - Higher 'alpha' values will result in a more pronounced sharpening effect.
+        - Higher 'lightness' values will increase the contrast of the sharpened areas.
+        - This transform can be useful for:
+          * Enhancing edge details in images
+          * Improving the perceived quality of slightly blurred images
+          * Creating a more crisp appearance in photographs
+
+    Mathematical Formulation:
+        The sharpening kernel K is defined as:
+
+        K = (1 - alpha) * I + alpha * L
+
+        where:
+        - alpha is the alpha value (from the 'alpha' parameter)
+        - I is the identity kernel [[0, 0, 0], [0, 1, 0], [0, 0, 0]]
+        - L is the Laplacian kernel [[-1, -1, -1], [-1, 8+l, -1], [-1, -1, -1]]
+          (l is the lightness value from the 'lightness' parameter)
+
+        The sharpened image S is obtained by convolving the input image I with the kernel K:
+
+        S = I * K
+
+        The final output O is a blend of the original and sharpened images:
+
+        O = (1 - alpha) * I + alpha * S
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+
+        # Apply sharpening with default parameters
+        >>> transform = A.Sharpen(p=1.0)
+        >>> sharpened_image = transform(image=image)['image']
+
+        # Apply sharpening with custom parameters
+        >>> transform = A.Sharpen(alpha=(0.4, 0.7), lightness=(0.8, 1.2), p=1.0)
+        >>> sharpened_image = transform(image=image)['image']
+
+    References:
+        - Image sharpening: https://en.wikipedia.org/wiki/Unsharp_masking
+        - Laplacian operator: https://en.wikipedia.org/wiki/Laplace_operator
+        - "Digital Image Processing" by Rafael C. Gonzalez and Richard E. Woods, 4th Edition
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        alpha: Annotated[tuple[float, float], AfterValidator(check_01)]
+        lightness: Annotated[tuple[float, float], AfterValidator(check_0plus)]
+
+    def __init__(
+        self,
+        alpha: tuple[float, float] = (0.2, 0.5),
+        lightness: tuple[float, float] = (0.5, 1.0),
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.alpha = alpha
+        self.lightness = lightness
+
+    @staticmethod
+    def __generate_sharpening_matrix(alpha_sample: np.ndarray, lightness_sample: np.ndarray) -> np.ndarray:
+        matrix_nochange = np.array([[0, 0, 0], [0, 1, 0], [0, 0, 0]], dtype=np.float32)
+        matrix_effect = np.array(
+            [[-1, -1, -1], [-1, 8 + lightness_sample, -1], [-1, -1, -1]],
+            dtype=np.float32,
+        )
+
+        return (1 - alpha_sample) * matrix_nochange + alpha_sample * matrix_effect
+
+    def get_params(self) -> dict[str, np.ndarray]:
+        alpha = random.uniform(*self.alpha)
+        lightness = random.uniform(*self.lightness)
+        sharpening_matrix = self.__generate_sharpening_matrix(alpha_sample=alpha, lightness_sample=lightness)
+        return {"sharpening_matrix": sharpening_matrix}
+
+    def apply(self, img: np.ndarray, sharpening_matrix: np.ndarray, **params: Any) -> np.ndarray:
+        return fmain.convolve(img, sharpening_matrix)
+
+    def get_transform_init_args_names(self) -> tuple[str, str]:
+        return ("alpha", "lightness")
+
+
+class Emboss(ImageOnlyTransform):
+    """Apply embossing effect to the input image.
+
+    This transform creates an emboss effect by highlighting edges and creating a 3D-like texture
+    in the image. It works by applying a specific convolution kernel to the image that emphasizes
+    differences in adjacent pixel values.
+
+    Args:
+        alpha (tuple[float, float]): Range to choose the visibility of the embossed image.
+            At 0, only the original image is visible, at 1.0 only its embossed version is visible.
+            Values should be in the range [0, 1].
+            Alpha will be randomly selected from this range for each image.
+            Default: (0.2, 0.5)
+
+        strength (tuple[float, float]): Range to choose the strength of the embossing effect.
+            Higher values create a more pronounced 3D effect.
+            Values should be non-negative.
+            Strength will be randomly selected from this range for each image.
+            Default: (0.2, 0.7)
+
+        p (float): Probability of applying the transform. Should be in the range [0, 1].
+            Default: 0.5
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Note:
+        - The emboss effect is created using a 3x3 convolution kernel.
+        - The 'alpha' parameter controls the blend between the original image and the embossed version.
+          A higher alpha value will result in a more pronounced emboss effect.
+        - The 'strength' parameter affects the intensity of the embossing. Higher strength values
+          will create more contrast in the embossed areas, resulting in a stronger 3D-like effect.
+        - This transform can be useful for creating artistic effects or for data augmentation
+          in tasks where edge information is important.
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, (100, 100, 3), dtype=np.uint8)
+        >>> transform = A.Emboss(alpha=(0.2, 0.5), strength=(0.2, 0.7), p=0.5)
+        >>> result = transform(image=image)
+        >>> embossed_image = result['image']
+
+    References:
+        - https://en.wikipedia.org/wiki/Image_embossing
+        - https://www.researchgate.net/publication/303412455_Application_of_Emboss_Filtering_in_Image_Processing
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        alpha: Annotated[tuple[float, float], AfterValidator(check_01)]
+        strength: Annotated[tuple[float, float], AfterValidator(check_0plus)]
+
+    def __init__(
+        self,
+        alpha: tuple[float, float] = (0.2, 0.5),
+        strength: tuple[float, float] = (0.2, 0.7),
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.alpha = alpha
+        self.strength = strength
+
+    @staticmethod
+    def __generate_emboss_matrix(alpha_sample: np.ndarray, strength_sample: np.ndarray) -> np.ndarray:
+        matrix_nochange = np.array([[0, 0, 0], [0, 1, 0], [0, 0, 0]], dtype=np.float32)
+        matrix_effect = np.array(
+            [
+                [-1 - strength_sample, 0 - strength_sample, 0],
+                [0 - strength_sample, 1, 0 + strength_sample],
+                [0, 0 + strength_sample, 1 + strength_sample],
+            ],
+            dtype=np.float32,
+        )
+        return (1 - alpha_sample) * matrix_nochange + alpha_sample * matrix_effect
+
+    def get_params(self) -> dict[str, np.ndarray]:
+        alpha = random.uniform(*self.alpha)
+        strength = random.uniform(*self.strength)
+        emboss_matrix = self.__generate_emboss_matrix(alpha_sample=alpha, strength_sample=strength)
+        return {"emboss_matrix": emboss_matrix}
+
+    def apply(self, img: np.ndarray, emboss_matrix: np.ndarray, **params: Any) -> np.ndarray:
+        return fmain.convolve(img, emboss_matrix)
+
+    def get_transform_init_args_names(self) -> tuple[str, str]:
+        return ("alpha", "strength")
+
+
+class Superpixels(ImageOnlyTransform):
+    """Transform images partially/completely to their superpixel representation.
+    This implementation uses skimage's version of the SLIC algorithm.
+
+    Args:
+        p_replace (float or tuple of float): Defines for any segment the probability that the pixels within that
+            segment are replaced by their average color (otherwise, the pixels are not changed).
+
+    Examples:
+                * A probability of ``0.0`` would mean, that the pixels in no
+                  segment are replaced by their average color (image is not
+                  changed at all).
+                * A probability of ``0.5`` would mean, that around half of all
+                  segments are replaced by their average color.
+                * A probability of ``1.0`` would mean, that all segments are
+                  replaced by their average color (resulting in a Voronoi
+                  image).
+            Behavior based on chosen data types for this parameter:
+                * If a ``float``, then that ``flat`` will always be used.
+                * If ``tuple`` ``(a, b)``, then a random probability will be
+                  sampled from the interval ``[a, b]`` per image.
+        n_segments (tuple of int): Rough target number of how many superpixels to generate (the algorithm
+            may deviate from this number). Lower value will lead to coarser superpixels.
+            Higher values are computationally more intensive and will hence lead to a slowdown
+            Then a value from the discrete interval ``[a..b]`` will be sampled per image.
+            If input is a single integer, the range will be ``(1, n_segments)``.
+            If interested in a fixed number of segments, use ``(n_segments, n_segments)``.
+        max_size (int or None): Maximum image size at which the augmentation is performed.
+            If the width or height of an image exceeds this value, it will be
+            downscaled before the augmentation so that the longest side matches `max_size`.
+            This is done to speed up the process. The final output image has the same size as the input image.
+            Note that in case `p_replace` is below ``1.0``,
+            the down-/upscaling will affect the not-replaced pixels too.
+            Use ``None`` to apply no down-/upscaling.
+        interpolation (OpenCV flag): flag that is used to specify the interpolation algorithm. Should be one of:
+            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
+            Default: cv2.INTER_LINEAR.
+        p (float): probability of applying the transform. Default: 0.5.
+
+    Targets:
+        image
+
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        p_replace: ZeroOneRangeType
+        n_segments: OnePlusIntRangeType
+        max_size: int | None = Field(ge=1)
+        interpolation: InterpolationType
+
+    def __init__(
+        self,
+        p_replace: ScaleFloatType = (0, 0.1),
+        n_segments: ScaleIntType = (100, 100),
+        max_size: int | None = 128,
+        interpolation: int = cv2.INTER_LINEAR,
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.p_replace = cast(Tuple[float, float], p_replace)
+        self.n_segments = cast(Tuple[int, int], n_segments)
+        self.max_size = max_size
+        self.interpolation = interpolation
+
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return "p_replace", "n_segments", "max_size", "interpolation"
+
+    def get_params(self) -> dict[str, Any]:
+        n_segments = random.randint(self.n_segments[0], self.n_segments[1])
+        p = random.uniform(*self.p_replace)
+        return {"replace_samples": random_utils.random(n_segments) < p, "n_segments": n_segments}
+
+    def apply(
+        self,
+        img: np.ndarray,
+        replace_samples: Sequence[bool],
+        n_segments: int,
+        **kwargs: Any,
+    ) -> np.ndarray:
+        return fmain.superpixels(img, n_segments, replace_samples, self.max_size, self.interpolation)
+
+
+class TemplateTransform(ImageOnlyTransform):
+    """Apply blending of input image with specified templates
+    Args:
+        templates (numpy array or list of numpy arrays): Images as template for transform.
+        img_weight: If single float weight will be sampled from (0, img_weight).
+            If tuple of float img_weight will be in range `[img_weight[0], img_weight[1])`.
+            If you want fixed weight, use (img_weight, img_weight)
+            Default: (0.5, 0.5).
+        template_weight: If single float weight will be sampled from (0, template_weight).
+            If tuple of float template_weight will be in range `[template_weight[0], template_weight[1])`.
+            If you want fixed weight, use (template_weight, template_weight)
+            Default: (0.5, 0.5).
+        template_transform: transformation object which could be applied to template,
+            must produce template the same size as input image.
+        name: (Optional) Name of transform, used only for deserialization.
+        p: probability of applying the transform. Default: 0.5.
+    Targets:
+        image
+    Image types:
+        uint8, float32
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        templates: np.ndarray | Sequence[np.ndarray] = Field(..., description="Images as template for transform.")
+        img_weight: ZeroOneRangeType = (0.5, 0.5)
+        template_weight: ZeroOneRangeType = (0.5, 0.5)
+        template_transform: Callable[..., Any] | None = Field(
+            default=None,
+            description="Transformation object applied to template.",
+        )
+        name: str | None = Field(default=None, description="Name of transform, used only for deserialization.")
+
+        @field_validator("templates")
+        @classmethod
+        def validate_templates(cls, v: np.ndarray | list[np.ndarray]) -> list[np.ndarray]:
+            if isinstance(v, np.ndarray):
+                return [v]
+            if isinstance(v, list):
+                if not all(isinstance(item, np.ndarray) for item in v):
+                    msg = "All templates must be numpy arrays."
+                    raise ValueError(msg)
+                return v
+            msg = "Templates must be a numpy array or a list of numpy arrays."
+            raise TypeError(msg)
+
+    def __init__(
+        self,
+        templates: np.ndarray | list[np.ndarray],
+        img_weight: ScaleFloatType = (0.5, 0.5),
+        template_weight: ScaleFloatType = (0.5, 0.5),
+        template_transform: Callable[..., Any] | None = None,
+        name: str | None = None,
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.templates = templates
+        self.img_weight = cast(Tuple[float, float], img_weight)
+        self.template_weight = cast(Tuple[float, float], template_weight)
+        self.template_transform = template_transform
+        self.name = name
+
+    def apply(
+        self,
+        img: np.ndarray,
+        template: np.ndarray,
+        img_weight: float,
+        template_weight: float,
+        **params: Any,
+    ) -> np.ndarray:
+        return add_weighted(img, img_weight, template, template_weight)
+
+    def get_params(self) -> dict[str, float]:
+        return {
+            "img_weight": random.uniform(self.img_weight[0], self.img_weight[1]),
+            "template_weight": random.uniform(self.template_weight[0], self.template_weight[1]),
+        }
+
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        img = data["image"] if "image" in data else data["images"][0]
+        template = random.choice(self.templates)
+
+        if self.template_transform is not None:
+            template = self.template_transform(image=template)["image"]
+
+        if get_num_channels(template) not in [1, get_num_channels(img)]:
+            msg = (
+                "Template must be a single channel or "
+                "has the same number of channels as input "
+                f"image ({get_num_channels(img)}), got {get_num_channels(template)}"
+            )
+            raise ValueError(msg)
+
+        if template.dtype != img.dtype:
+            msg = "Image and template must be the same image type"
+            raise ValueError(msg)
+
+        if img.shape[:2] != template.shape[:2]:
+            raise ValueError(f"Image and template must be the same size, got {img.shape[:2]} and {template.shape[:2]}")
+
+        if get_num_channels(template) == 1 and get_num_channels(img) > 1:
+            template = np.stack((template,) * get_num_channels(img), axis=-1)
+
+        # in order to support grayscale image with dummy dim
+        template = template.reshape(img.shape)
+
+        return {"template": template}
+
+    @classmethod
+    def is_serializable(cls) -> bool:
+        return False
+
+    def to_dict_private(self) -> dict[str, Any]:
+        if self.name is None:
+            msg = (
+                "To make a TemplateTransform serializable you should provide the `name` argument, "
+                "e.g. `TemplateTransform(name='my_transform', ...)`."
+            )
+            raise ValueError(msg)
+        return {"__class_fullname__": self.get_class_fullname(), "__name__": self.name}
+
+
+class RingingOvershoot(ImageOnlyTransform):
+    """Create ringing or overshoot artifacts by convolving the image with a 2D sinc filter.
+
+    This transform simulates the ringing artifacts that can occur in digital image processing,
+    particularly after sharpening or edge enhancement operations. It creates oscillations
+    or overshoots near sharp transitions in the image.
+
+    Args:
+        blur_limit (int, tuple of int): Maximum kernel size for the sinc filter.
+            Must be an odd number in the range [3, inf).
+            If a single int is provided, the kernel size will be randomly chosen
+            from the range (3, blur_limit). If a tuple (min, max) is provided,
+            the kernel size will be randomly chosen from the range (min, max).
+            Default: (7, 15).
+        cutoff (tuple of float): Range to choose the cutoff frequency in radians.
+            Values should be in the range (0, π). A lower cutoff frequency will
+            result in more pronounced ringing effects.
+            Default: (π/4, π/2).
+        p (float): Probability of applying the transform. Default: 0.5.
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - Ringing artifacts are oscillations of the image intensity function in the neighborhood
+          of sharp transitions, such as edges or object boundaries.
+        - This transform uses a 2D sinc filter (also known as a 2D cardinal sine function)
+          to introduce these artifacts.
+        - The severity of the ringing effect is controlled by both the kernel size (blur_limit)
+          and the cutoff frequency.
+        - Larger kernel sizes and lower cutoff frequencies will generally produce more
+          noticeable ringing effects.
+        - This transform can be useful for:
+          * Simulating imperfections in image processing or transmission systems
+          * Testing the robustness of computer vision models to ringing artifacts
+          * Creating artistic effects that emphasize edges and transitions in images
+
+    Mathematical Formulation:
+        The 2D sinc filter kernel is defined as:
+
+        K(x, y) = cutoff * J₁(cutoff * √(x² + y²)) / (2π * √(x² + y²))
+
+        where:
+        - J₁ is the Bessel function of the first kind of order 1
+        - cutoff is the chosen cutoff frequency
+        - x and y are the distances from the kernel center
+
+        The filtered image I' is obtained by convolving the input image I with the kernel K:
+
+        I'(x, y) = ∑∑ I(x-u, y-v) * K(u, v)
+
+        The convolution operation introduces the ringing artifacts near sharp transitions.
+
+    Examples:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+
+        # Apply ringing effect with default parameters
+        >>> transform = A.RingingOvershoot(p=1.0)
+        >>> ringing_image = transform(image=image)['image']
+
+        # Apply ringing effect with custom parameters
+        >>> transform = A.RingingOvershoot(
+        ...     blur_limit=(9, 17),
+        ...     cutoff=(np.pi/6, np.pi/3),
+        ...     p=1.0
+        ... )
+        >>> ringing_image = transform(image=image)['image']
+
+    References:
+        - Ringing artifacts: https://en.wikipedia.org/wiki/Ringing_artifacts
+        - Sinc filter: https://en.wikipedia.org/wiki/Sinc_filter
+        - "The Importance of Ringing Artifacts in Image Processing" by Jae S. Lim, 1981
+        - "Digital Image Processing" by Rafael C. Gonzalez and Richard E. Woods, 4th Edition
+    """
+
+    class InitSchema(BlurInitSchema):
+        blur_limit: ScaleIntType
+        cutoff: Annotated[tuple[float, float], nondecreasing]
+
+        @field_validator("cutoff")
+        @classmethod
+        def check_cutoff(cls, v: tuple[float, float], info: ValidationInfo) -> tuple[float, float]:
+            bounds = 0, np.pi
+            check_range(v, *bounds, info.field_name)
+            return v
+
+    def __init__(
+        self,
+        blur_limit: ScaleIntType = (7, 15),
+        cutoff: tuple[float, float] = (np.pi / 4, np.pi / 2),
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.blur_limit = cast(Tuple[int, int], blur_limit)
+        self.cutoff = cutoff
+
+    def get_params(self) -> dict[str, np.ndarray]:
+        ksize = random.randrange(self.blur_limit[0], self.blur_limit[1] + 1, 2)
+        if ksize % 2 == 0:
+            raise ValueError(f"Kernel size must be odd. Got: {ksize}")
+
+        cutoff = random.uniform(*self.cutoff)
+
+        # From dsp.stackexchange.com/questions/58301/2-d-circularly-symmetric-low-pass-filter
+        with np.errstate(divide="ignore", invalid="ignore"):
+            kernel = np.fromfunction(
+                lambda x, y: cutoff
+                * special.j1(cutoff * np.sqrt((x - (ksize - 1) / 2) ** 2 + (y - (ksize - 1) / 2) ** 2))
+                / (2 * np.pi * np.sqrt((x - (ksize - 1) / 2) ** 2 + (y - (ksize - 1) / 2) ** 2)),
+                [ksize, ksize],
+            )
+        kernel[(ksize - 1) // 2, (ksize - 1) // 2] = cutoff**2 / (4 * np.pi)
+
+        # Normalize kernel
+        kernel = kernel.astype(np.float32) / np.sum(kernel)
+
+        return {"kernel": kernel}
+
+    def apply(self, img: np.ndarray, kernel: int, **params: Any) -> np.ndarray:
+        return fmain.convolve(img, kernel)
+
+    def get_transform_init_args_names(self) -> tuple[str, str]:
+        return ("blur_limit", "cutoff")
+
+
+class UnsharpMask(ImageOnlyTransform):
+    """Sharpen the input image using Unsharp Masking processing and overlays the result with the original image.
+
+    Args:
+        blur_limit: maximum Gaussian kernel size for blurring the input image.
+            Must be zero or odd and in range [0, inf). If set to 0 it will be computed from sigma
+            as `round(sigma * (3 if img.dtype == np.uint8 else 4) * 2 + 1) + 1`.
+            If set single value `blur_limit` will be in range (0, blur_limit).
+            Default: (3, 7).
+        sigma_limit: Gaussian kernel standard deviation. Must be in range [0, inf).
+            If set single value `sigma_limit` will be in range (0, sigma_limit).
+            If set to 0 sigma will be computed as `sigma = 0.3*((ksize-1)*0.5 - 1) + 0.8`. Default: 0.
+        alpha: range to choose the visibility of the sharpened image.
+            At 0, only the original image is visible, at 1.0 only its sharpened version is visible.
+            Default: (0.2, 0.5).
+        threshold: Value to limit sharpening only for areas with high pixel difference between original image
+            and it's smoothed version. Higher threshold means less sharpening on flat areas.
+            Must be in range [0, 255]. Default: 10.
+        p: probability of applying the transform. Default: 0.5.
+
+    Reference:
+        arxiv.org/pdf/2107.10833.pdf
+
+    Targets:
+        image
+
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        sigma_limit: NonNegativeFloatRangeType
+        alpha: ZeroOneRangeType
+        threshold: int = Field(ge=0, le=255)
+        blur_limit: ScaleIntType
+
+        @field_validator("blur_limit")
+        @classmethod
+        def process_blur(cls, value: ScaleIntType, info: ValidationInfo) -> tuple[int, int]:
+            return process_blur_limit(value, info, min_value=3)
+
+    def __init__(
+        self,
+        blur_limit: ScaleIntType = (3, 7),
+        sigma_limit: ScaleFloatType = 0.0,
+        alpha: ScaleFloatType = (0.2, 0.5),
+        threshold: int = 10,
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.blur_limit = cast(Tuple[int, int], blur_limit)
+        self.sigma_limit = cast(Tuple[float, float], sigma_limit)
+        self.alpha = cast(Tuple[float, float], alpha)
+        self.threshold = threshold
+
+    def get_params(self) -> dict[str, Any]:
+        return {
+            "ksize": random.randrange(self.blur_limit[0], self.blur_limit[1] + 1, 2),
+            "sigma": random.uniform(*self.sigma_limit),
+            "alpha": random.uniform(*self.alpha),
+        }
+
+    def apply(self, img: np.ndarray, ksize: int, sigma: int, alpha: float, **params: Any) -> np.ndarray:
+        return fmain.unsharp_mask(img, ksize, sigma=sigma, alpha=alpha, threshold=self.threshold)
+
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return "blur_limit", "sigma_limit", "alpha", "threshold"
+
+
+class PixelDropout(DualTransform):
+    """Set pixels to 0 with some probability.
+
+    Args:
+        dropout_prob (float): pixel drop probability. Default: 0.01
+        per_channel (bool): if set to `True` drop mask will be sampled for each channel,
+            otherwise the same mask will be sampled for all channels. Default: False
+        drop_value (number or sequence of numbers or None): Value that will be set in dropped place.
+            If set to None value will be sampled randomly, default ranges will be used:
+                - uint8 - [0, 255]
+                - uint16 - [0, 65535]
+                - uint32 - [0, 4294967295]
+                - float, double - [0, 1]
+            Default: 0
+        mask_drop_value (number or sequence of numbers or None): Value that will be set in dropped place in masks.
+            If set to None masks will be unchanged. Default: 0
+        p (float): probability of applying the transform. Default: 0.5.
+
+    Targets:
+        image, mask
+    Image types:
+        any
+
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        dropout_prob: ProbabilityType = 0.01
+        per_channel: bool = Field(default=False, description="Sample drop mask per channel.")
+        drop_value: ScaleFloatType | None = Field(
+            default=0,
+            description="Value to set in dropped pixels. None for random sampling.",
+        )
+        mask_drop_value: ScaleFloatType | None = Field(
+            default=None,
+            description="Value to set in dropped pixels in masks. None to leave masks unchanged.",
+        )
+
+        @model_validator(mode="after")
+        def validate_mask_drop_value(self) -> Self:
+            if self.mask_drop_value is not None and self.per_channel:
+                msg = "PixelDropout supports mask only with per_channel=False."
+                raise ValueError(msg)
+            return self
+
+    _targets = (Targets.IMAGE, Targets.MASK)
+
+    def __init__(
+        self,
+        dropout_prob: float = 0.01,
+        per_channel: bool = False,
+        drop_value: ScaleFloatType | None = 0,
+        mask_drop_value: ScaleFloatType | None = None,
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.dropout_prob = dropout_prob
+        self.per_channel = per_channel
+        self.drop_value = drop_value
+        self.mask_drop_value = mask_drop_value
+
+    def apply(
+        self,
+        img: np.ndarray,
+        drop_mask: np.ndarray,
+        drop_value: float | Sequence[float],
+        **params: Any,
+    ) -> np.ndarray:
+        return fmain.pixel_dropout(img, drop_mask, drop_value)
+
+    def apply_to_mask(self, mask: np.ndarray, drop_mask: np.ndarray, **params: Any) -> np.ndarray:
+        if self.mask_drop_value is None:
+            return mask
+
+        if mask.ndim == MONO_CHANNEL_DIMENSIONS:
+            drop_mask = np.squeeze(drop_mask)
+
+        return fmain.pixel_dropout(mask, drop_mask, self.mask_drop_value)
+
+    def apply_to_bboxes(self, bboxes: np.ndarray, **params: Any) -> np.ndarray:
+        return bboxes
+
+    def apply_to_keypoints(self, keypoints: np.ndarray, **params: Any) -> np.ndarray:
+        return keypoints
+
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        img = data["image"] if "image" in data else data["images"][0]
+        shape = img.shape if self.per_channel else img.shape[:2]
+
+        rnd = np.random.RandomState(random.randint(0, 1 << 31))
+        # Use choice to create boolean matrix, if we will use binomial after that we will need type conversion
+        drop_mask = rnd.choice([True, False], shape, p=[self.dropout_prob, 1 - self.dropout_prob])
+
+        drop_value: float | Sequence[float] | np.ndarray
+        if drop_mask.ndim != img.ndim:
+            drop_mask = np.expand_dims(drop_mask, -1)
+        if self.drop_value is None:
+            drop_shape = 1 if is_grayscale_image(img) else int(img.shape[-1])
+
+            if img.dtype in (np.uint8, np.uint16, np.uint32):
+                drop_value = rnd.randint(0, int(MAX_VALUES_BY_DTYPE[img.dtype]), drop_shape, img.dtype)
+            elif img.dtype in [np.float32, np.double]:
+                drop_value = rnd.uniform(0, 1, drop_shape).astype(img.dtype)
             else:
-                if not 1 <= self.holes_number_x <= width // 2:
-                    raise ValueError("The hole_number_x must be between 1 and image width//2.")
-                unit_width = width // self.holes_number_x
-            if self.holes_number_y is None:
-                unit_height = max(min(unit_width, height), 2)
+                raise ValueError(f"Unsupported dtype: {img.dtype}")
+        else:
+            drop_value = self.drop_value
+
+        return {"drop_mask": drop_mask, "drop_value": drop_value}
+
+    def get_transform_init_args_names(self) -> tuple[str, str, str, str]:
+        return ("dropout_prob", "per_channel", "drop_value", "mask_drop_value")
+
+
+class Spatter(ImageOnlyTransform):
+    """Apply spatter transform. It simulates corruption which can occlude a lens in the form of rain or mud.
+
+    Args:
+        mean (float, or tuple of floats): Mean value of normal distribution for generating liquid layer.
+            If single float mean will be sampled from `(0, mean)`
+            If tuple of float mean will be sampled from range `(mean[0], mean[1])`.
+            If you want constant value use (mean, mean).
+            Default (0.65, 0.65)
+        std (float, or tuple of floats): Standard deviation value of normal distribution for generating liquid layer.
+            If single float the number will be sampled from `(0, std)`.
+            If tuple of float std will be sampled from range `(std[0], std[1])`.
+            If you want constant value use (std, std).
+            Default: (0.3, 0.3).
+        gauss_sigma (float, or tuple of floats): Sigma value for gaussian filtering of liquid layer.
+            If single float the number will be sampled from `(0, gauss_sigma)`.
+            If tuple of float gauss_sigma will be sampled from range `(gauss_sigma[0], gauss_sigma[1])`.
+            If you want constant value use (gauss_sigma, gauss_sigma).
+            Default: (2, 3).
+        cutout_threshold (float, or tuple of floats): Threshold for filtering liqued layer
+            (determines number of drops). If single float it will used as cutout_threshold.
+            If single float the number will be sampled from `(0, cutout_threshold)`.
+            If tuple of float cutout_threshold will be sampled from range `(cutout_threshold[0], cutout_threshold[1])`.
+            If you want constant value use `(cutout_threshold, cutout_threshold)`.
+            Default: (0.68, 0.68).
+        intensity (float, or tuple of floats): Intensity of corruption.
+            If single float the number will be sampled from `(0, intensity)`.
+            If tuple of float intensity will be sampled from range `(intensity[0], intensity[1])`.
+            If you want constant value use `(intensity, intensity)`.
+            Default: (0.6, 0.6).
+        mode (string, or list of strings): Type of corruption. Currently, supported options are 'rain' and 'mud'.
+             If list is provided type of corruption will be sampled list. Default: ("rain").
+        color (list of (r, g, b) or dict or None): Corruption elements color.
+            If list uses provided list as color for specified mode.
+            If dict uses provided color for specified mode. Color for each specified mode should be provided in dict.
+            If None uses default colors (rain: (238, 238, 175), mud: (20, 42, 63)).
+        p (float): probability of applying the transform. Default: 0.5.
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Reference:
+        https://arxiv.org/abs/1903.12261
+        https://github.com/hendrycks/robustness/blob/master/ImageNet-C/create_c/make_imagenet_c.py
+
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        mean: ZeroOneRangeType = (0.65, 0.65)
+        std: ZeroOneRangeType = (0.3, 0.3)
+        gauss_sigma: NonNegativeFloatRangeType = (2, 2)
+        cutout_threshold: ZeroOneRangeType = (0.68, 0.68)
+        intensity: ZeroOneRangeType = (0.6, 0.6)
+        mode: SpatterMode | Sequence[SpatterMode] = Field(
+            default="rain",
+            description="Type of corruption ('rain', 'mud').",
+        )
+        color: Sequence[int] | dict[str, Sequence[int]] | None = None
+
+        @field_validator("mode")
+        @classmethod
+        def check_mode(cls, mode: SpatterMode | Sequence[SpatterMode]) -> Sequence[SpatterMode]:
+            if isinstance(mode, str):
+                return [mode]
+            return mode
+
+        @model_validator(mode="after")
+        def check_color(self) -> Self:
+            if self.color is None:
+                self.color = {"rain": [238, 238, 175], "mud": [20, 42, 63]}
+
+            elif isinstance(self.color, (list, tuple)) and len(self.mode) == 1:
+                if len(self.color) != NUM_RGB_CHANNELS:
+                    msg = "Color must be a list of three integers for RGB format."
+                    raise ValueError(msg)
+                self.color = {self.mode[0]: self.color}
+            elif isinstance(self.color, dict):
+                result = {}
+                for mode in self.mode:
+                    if mode not in self.color:
+                        raise ValueError(f"Color for mode {mode} is not specified.")
+                    if len(self.color[mode]) != NUM_RGB_CHANNELS:
+                        raise ValueError(f"Color for mode {mode} must be in RGB format.")
+                    result[mode] = self.color[mode]
             else:
-                if not 1 <= self.holes_number_y <= height // 2:
-                    raise ValueError("The hole_number_y must be between 1 and image height//2.")
-                unit_height = height // self.holes_number_y
+                msg = "Color must be a list of RGB values or a dict mapping mode to RGB values."
+                raise ValueError(msg)
+            return self
 
-        hole_width = int(unit_width * self.ratio)
-        hole_height = int(unit_height * self.ratio)
-        # min 1 pixel and max unit length - 1
-        hole_width = min(max(hole_width, 1), unit_width - 1)
-        hole_height = min(max(hole_height, 1), unit_height - 1)
-        # set offset of the grid
-        if self.shift_x is None:
-            shift_x = 0
-        else:
-            shift_x = min(max(0, self.shift_x), unit_width - hole_width)
-        if self.shift_y is None:
-            shift_y = 0
-        else:
-            shift_y = min(max(0, self.shift_y), unit_height - hole_height)
-        if self.random_offset:
-            shift_x = random.randint(0, unit_width - hole_width)
-            shift_y = random.randint(0, unit_height - hole_height)
-        holes = []
-        for i in range(width // unit_width + 1):
-            for j in range(height // unit_height + 1):
-                x1 = min(shift_x + unit_width * i, width)
-                y1 = min(shift_y + unit_height * j, height)
-                x2 = min(x1 + hole_width, width)
-                y2 = min(y1 + hole_height, height)
-                holes.append((x1, y1, x2, y2))
+    def __init__(
+        self,
+        mean: ScaleFloatType = (0.65, 0.65),
+        std: ScaleFloatType = (0.3, 0.3),
+        gauss_sigma: ScaleFloatType = (2, 2),
+        cutout_threshold: ScaleFloatType = (0.68, 0.68),
+        intensity: ScaleFloatType = (0.6, 0.6),
+        mode: SpatterMode | Sequence[SpatterMode] = "rain",
+        color: Sequence[int] | dict[str, Sequence[int]] | None = None,
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.mean = cast(Tuple[float, float], mean)
+        self.std = cast(Tuple[float, float], std)
+        self.gauss_sigma = cast(Tuple[float, float], gauss_sigma)
+        self.cutout_threshold = cast(Tuple[float, float], cutout_threshold)
+        self.intensity = cast(Tuple[float, float], intensity)
+        self.mode = mode
+        self.color = cast(Dict[str, Sequence[int]], color)
 
-        return {"holes": holes}
+    def apply(
+        self,
+        img: np.ndarray,
+        non_mud: np.ndarray,
+        mud: np.ndarray,
+        drops: np.ndarray,
+        mode: SpatterMode,
+        **params: dict[str, Any],
+    ) -> np.ndarray:
+        return fmain.spatter(img, non_mud, mud, drops, mode)
+
+    def get_params_dependent_on_data(self, params: dict[str, Any], data: dict[str, Any]) -> dict[str, Any]:
+        height, width = params["shape"][:2]
+
+        mean = random.uniform(*self.mean)
+        std = random.uniform(*self.std)
+        cutout_threshold = random.uniform(*self.cutout_threshold)
+        sigma = random.uniform(*self.gauss_sigma)
+        mode = random.choice(self.mode)
+        intensity = random.uniform(*self.intensity)
+        color = np.array(self.color[mode]) / 255.0
+
+        liquid_layer = random_utils.normal(size=(height, width), loc=mean, scale=std)
+        liquid_layer = gaussian_filter(liquid_layer, sigma=sigma, mode="nearest")
+        liquid_layer[liquid_layer < cutout_threshold] = 0
+
+        if mode == "rain":
+            liquid_layer = clip(liquid_layer * 255, np.uint8)
+            dist = 255 - cv2.Canny(liquid_layer, 50, 150)
+            dist = cv2.distanceTransform(dist, cv2.DIST_L2, 5)
+            _, dist = cv2.threshold(dist, 20, 20, cv2.THRESH_TRUNC)
+            dist = clip(blur(dist, 3), np.uint8)
+            dist = fmain.equalize(dist)
+
+            ker = np.array([[-2, -1, 0], [-1, 1, 1], [0, 1, 2]])
+            dist = fmain.convolve(dist, ker)
+            dist = blur(dist, 3).astype(np.float32)
+
+            m = liquid_layer * dist
+            m *= 1 / np.max(m, axis=(0, 1))
+
+            drops = m[:, :, None] * color * intensity
+            mud = None
+            non_mud = None
+        else:
+            m = np.where(liquid_layer > cutout_threshold, 1, 0)
+            m = gaussian_filter(m.astype(np.float32), sigma=sigma, mode="nearest")
+            m[m < 1.2 * cutout_threshold] = 0
+            m = m[..., np.newaxis]
+
+            mud = m * color
+            non_mud = 1 - m
+            drops = None
+
+        return {
+            "non_mud": non_mud,
+            "mud": mud,
+            "drops": drops,
+            "mode": mode,
+        }
+
+    def get_transform_init_args_names(self) -> tuple[str, str, str, str, str, str, str]:
+        return "mean", "std", "gauss_sigma", "intensity", "cutout_threshold", "mode", "color"
+
+
+class ChromaticAberration(ImageOnlyTransform):
+    """Add lateral chromatic aberration by distorting the red and blue channels of the input image.
+
+    Chromatic aberration is an optical effect that occurs when a lens fails to focus all colors to the same point.
+    This transform simulates this effect by applying different radial distortions to the red and blue channels
+    of the image, while leaving the green channel unchanged.
+
+    Args:
+        primary_distortion_limit (tuple[float, float] | float): Range of the primary radial distortion coefficient.
+            If a single float value is provided, the range
+            will be (-primary_distortion_limit, primary_distortion_limit).
+            This parameter controls the distortion in the center of the image:
+            - Positive values result in pincushion distortion (edges bend inward)
+            - Negative values result in barrel distortion (edges bend outward)
+            Default: (-0.02, 0.02).
+
+        secondary_distortion_limit (tuple[float, float] | float): Range of the secondary radial distortion coefficient.
+            If a single float value is provided, the range
+            will be (-secondary_distortion_limit, secondary_distortion_limit).
+            This parameter controls the distortion in the corners of the image:
+            - Positive values enhance pincushion distortion
+            - Negative values enhance barrel distortion
+            Default: (-0.05, 0.05).
+
+        mode (Literal["green_purple", "red_blue", "random"]): Type of color fringing to apply. Options are:
+            - 'green_purple': Distorts red and blue channels in opposite directions, creating green-purple fringing.
+            - 'red_blue': Distorts red and blue channels in the same direction, creating red-blue fringing.
+            - 'random': Randomly chooses between 'green_purple' and 'red_blue' modes for each application.
+            Default: 'green_purple'.
+
+        interpolation (InterpolationType): Flag specifying the interpolation algorithm. Should be one of:
+            cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4.
+            Default: cv2.INTER_LINEAR.
+
+        p (float): Probability of applying the transform. Should be in the range [0, 1].
+            Default: 0.5.
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Note:
+        - This transform only affects RGB images. Grayscale images will raise an error.
+        - The strength of the effect depends on both primary and secondary distortion limits.
+        - Higher absolute values for distortion limits will result in more pronounced chromatic aberration.
+        - The 'green_purple' mode tends to produce more noticeable effects than 'red_blue'.
+
+    Example:
+        >>> import albumentations as A
+        >>> import cv2
+        >>> transform = A.ChromaticAberration(
+        ...     primary_distortion_limit=0.05,
+        ...     secondary_distortion_limit=0.1,
+        ...     mode='green_purple',
+        ...     interpolation=cv2.INTER_LINEAR,
+        ...     p=1.0
+        ... )
+        >>> transformed = transform(image=image)
+        >>> aberrated_image = transformed['image']
+
+    References:
+        - https://en.wikipedia.org/wiki/Chromatic_aberration
+        - https://www.researchgate.net/publication/320691320_Chromatic_Aberration_in_Digital_Images
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        primary_distortion_limit: SymmetricRangeType
+        secondary_distortion_limit: SymmetricRangeType
+        mode: ChromaticAberrationMode
+        interpolation: InterpolationType
+
+    def __init__(
+        self,
+        primary_distortion_limit: ScaleFloatType = (-0.02, 0.02),
+        secondary_distortion_limit: ScaleFloatType = (-0.05, 0.05),
+        mode: ChromaticAberrationMode = "green_purple",
+        interpolation: InterpolationType = cv2.INTER_LINEAR,
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p=p, always_apply=always_apply)
+        self.primary_distortion_limit = cast(Tuple[float, float], primary_distortion_limit)
+        self.secondary_distortion_limit = cast(Tuple[float, float], secondary_distortion_limit)
+        self.mode = mode
+        self.interpolation = interpolation
+
+    def apply(
+        self,
+        img: np.ndarray,
+        primary_distortion_red: float,
+        secondary_distortion_red: float,
+        primary_distortion_blue: float,
+        secondary_distortion_blue: float,
+        **params: Any,
+    ) -> np.ndarray:
+        non_rgb_error(img)
+        return fmain.chromatic_aberration(
+            img,
+            primary_distortion_red,
+            secondary_distortion_red,
+            primary_distortion_blue,
+            secondary_distortion_blue,
+            self.interpolation,
+        )
+
+    def get_params(self) -> dict[str, float]:
+        primary_distortion_red = random.uniform(*self.primary_distortion_limit)
+        secondary_distortion_red = random.uniform(*self.secondary_distortion_limit)
+        primary_distortion_blue = random.uniform(*self.primary_distortion_limit)
+        secondary_distortion_blue = random.uniform(*self.secondary_distortion_limit)
+
+        secondary_distortion_red = self._match_sign(primary_distortion_red, secondary_distortion_red)
+        secondary_distortion_blue = self._match_sign(primary_distortion_blue, secondary_distortion_blue)
+
+        if self.mode == "green_purple":
+            # distortion coefficients of the red and blue channels have the same sign
+            primary_distortion_blue = self._match_sign(primary_distortion_red, primary_distortion_blue)
+            secondary_distortion_blue = self._match_sign(secondary_distortion_red, secondary_distortion_blue)
+        if self.mode == "red_blue":
+            # distortion coefficients of the red and blue channels have the opposite sign
+            primary_distortion_blue = self._unmatch_sign(primary_distortion_red, primary_distortion_blue)
+            secondary_distortion_blue = self._unmatch_sign(secondary_distortion_red, secondary_distortion_blue)
+
+        return {
+            "primary_distortion_red": primary_distortion_red,
+            "secondary_distortion_red": secondary_distortion_red,
+            "primary_distortion_blue": primary_distortion_blue,
+            "secondary_distortion_blue": secondary_distortion_blue,
+        }
+
+    @staticmethod
+    def _match_sign(a: float, b: float) -> float:
+        # Match the sign of b to a
+        if (a < 0 < b) or (a > 0 > b):
+            return -b
+        return b
+
+    @staticmethod
+    def _unmatch_sign(a: float, b: float) -> float:
+        # Unmatch the sign of b to a
+        if (a < 0 and b < 0) or (a > 0 and b > 0):
+            return -b
+        return b
+
+    def get_transform_init_args_names(self) -> tuple[str, str, str, str]:
+        return "primary_distortion_limit", "secondary_distortion_limit", "mode", "interpolation"
+
+
+class Morphological(DualTransform):
+    """Apply a morphological operation (dilation or erosion) to an image,
+    with particular value for enhancing document scans.
+
+    Morphological operations modify the structure of the image.
+    Dilation expands the white (foreground) regions in a binary or grayscale image, while erosion shrinks them.
+    These operations are beneficial in document processing, for example:
+    - Dilation helps in closing up gaps within text or making thin lines thicker,
+        enhancing legibility for OCR (Optical Character Recognition).
+    - Erosion can remove small white noise and detach connected objects,
+        making the structure of larger objects more pronounced.
+
+    Args:
+        scale (int or tuple/list of int): Specifies the size of the structuring element (kernel) used for the operation.
+            - If an integer is provided, a square kernel of that size will be used.
+            - If a tuple or list is provided, it should contain two integers representing the minimum
+                and maximum sizes for the dilation kernel.
+        operation (str, optional): The morphological operation to apply. Options are 'dilation' or 'erosion'.
+            Default is 'dilation'.
+        p (float, optional): The probability of applying this transformation. Default is 0.5.
+
+    Targets:
+        image, mask
+
+    Image types:
+        uint8, float32
+
+    Reference:
+        https://github.com/facebookresearch/nougat
+
+    Example:
+        >>> import albumentations as A
+        >>> transform = A.Compose([
+        >>>     A.Morphological(scale=(2, 3), operation='dilation', p=0.5)
+        >>> ])
+        >>> image = transform(image=image)["image"]
+    """
+
+    _targets = (Targets.IMAGE, Targets.MASK)
+
+    class InitSchema(BaseTransformInitSchema):
+        scale: OnePlusIntRangeType = (2, 3)
+        operation: MorphologyMode = "dilation"
+
+    def __init__(
+        self,
+        scale: ScaleIntType = (2, 3),
+        operation: MorphologyMode = "dilation",
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ):
+        super().__init__(p, always_apply)
+        self.scale = cast(Tuple[int, int], scale)
+        self.operation = operation
+
+    def apply(self, img: np.ndarray, kernel: tuple[int, int], **params: Any) -> np.ndarray:
+        return fmain.morphology(img, kernel, self.operation)
+
+    def apply_to_mask(self, mask: np.ndarray, kernel: tuple[int, int], **params: Any) -> np.ndarray:
+        return fmain.morphology(mask, kernel, self.operation)
+
+    def get_params(self) -> dict[str, float]:
+        return {
+            "kernel": cv2.getStructuringElement(cv2.MORPH_ELLIPSE, self.scale),
+        }
+
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return ("scale", "operation")
 
     @property
-    def targets_as_params(self):
-        return ["image"]
+    def targets(self) -> dict[str, Callable[..., Any]]:
+        return {
+            "image": self.apply,
+            "mask": self.apply_to_mask,
+            "masks": self.apply_to_masks,
+        }
 
-    def get_transform_init_args_names(self):
-        return (
-            "ratio",
-            "unit_size_min",
-            "unit_size_max",
-            "holes_number_x",
-            "holes_number_y",
-            "shift_x",
-            "shift_y",
-            "mask_fill_value",
-            "random_offset",
-        )
+
+PLANKIAN_JITTER_CONST = {
+    "MAX_TEMP": 15_000,
+    "MIN_BLACKBODY_TEMP": 3_000,
+    "MIN_CIED_TEMP": 4_000,
+    "WHITE_TEMP": 6_000,
+    "SAMPLING_TEMP_PROB": 0.4,
+}
+
+
+class PlanckianJitter(ImageOnlyTransform):
+    """Applies Planckian Jitter to the input image, simulating color temperature variations in illumination.
+
+    This transform adjusts the color of an image to mimic the effect of different color temperatures
+    of light sources, based on Planck's law of black body radiation. It can simulate the appearance
+    of an image under various lighting conditions, from warm (reddish) to cool (bluish) color casts.
+
+    PlanckianJitter vs. ColorJitter:
+    PlanckianJitter is fundamentally different from ColorJitter in its approach and use cases:
+    1. Physics-based: PlanckianJitter is grounded in the physics of light, simulating real-world
+       color temperature changes. ColorJitter applies arbitrary color adjustments.
+    2. Natural effects: This transform produces color shifts that correspond to natural lighting
+       variations, making it ideal for outdoor scene simulation or color constancy problems.
+    3. Single parameter: Color changes are controlled by a single, physically meaningful parameter
+       (color temperature), unlike ColorJitter's multiple abstract parameters.
+    4. Correlated changes: Color shifts are correlated across channels in a way that mimics natural
+       light, whereas ColorJitter can make independent channel adjustments.
+
+    When to use PlanckianJitter:
+    - Simulating different times of day or lighting conditions in outdoor scenes
+    - Augmenting data for computer vision tasks that need to be robust to natural lighting changes
+    - Preparing synthetic data to better match real-world lighting variations
+    - Color constancy research or applications
+    - When you need physically plausible color variations rather than arbitrary color changes
+
+    The logic behind PlanckianJitter:
+    As the color temperature increases:
+    1. Lower temperatures (around 3000K) produce warm, reddish tones, simulating sunset or incandescent lighting.
+    2. Mid-range temperatures (around 5500K) correspond to daylight.
+    3. Higher temperatures (above 7000K) result in cool, bluish tones, similar to overcast sky or shade.
+    This progression mimics the natural variation of sunlight throughout the day and in different weather conditions.
+
+    Args:
+        mode (Literal["blackbody", "cied"]): The mode of the transformation.
+            - "blackbody": Simulates blackbody radiation color changes.
+            - "cied": Uses the CIE D illuminant series for color temperature simulation.
+            Default: "blackbody"
+
+        temperature_range (tuple[int, int] | None): The range of color temperatures (in Kelvin) to sample from.
+            - For "blackbody" mode: Should be within [3000K, 15000K]. Default: (3000, 15000)
+            - For "cied" mode: Should be within [4000K, 15000K]. Default: (4000, 15000)
+            If None, the default ranges will be used based on the selected mode.
+            Higher temperatures produce cooler (bluish) images, lower temperatures produce warmer (reddish) images.
+
+        sampling_method (Literal["uniform", "gaussian"]): Method to sample the temperature.
+            - "uniform": Samples uniformly across the specified range.
+            - "gaussian": Samples from a Gaussian distribution centered at 6500K (approximate daylight).
+            Default: "uniform"
+
+        p (float): Probability of applying the transform. Default: 0.5
+
+    Targets:
+        image
+
+    Image types:
+        uint8, float32
+
+    Number of channels:
+        Any
+
+    Note:
+        - The transform preserves the overall brightness of the image while shifting its color.
+        - The "blackbody" mode provides a wider range of color shifts, especially in the lower (warmer) temperatures.
+        - The "cied" mode is based on standard illuminants and may provide more realistic daylight variations.
+        - The Gaussian sampling method tends to produce more subtle variations, as it's centered around daylight.
+        - Unlike ColorJitter, this transform ensures that color changes are physically plausible and correlated
+          across channels, maintaining the natural appearance of the scene under different lighting conditions.
+
+    Example:
+        >>> import numpy as np
+        >>> import albumentations as A
+        >>> image = np.random.randint(0, 256, [100, 100, 3], dtype=np.uint8)
+        >>> transform = A.PlanckianJitter(mode="blackbody",
+        ...                               temperature_range=(3000, 9000),
+        ...                               sampling_method="uniform",
+        ...                               p=1.0)
+        >>> result = transform(image=image)
+        >>> jittered_image = result["image"]
+
+    References:
+        - Planck's law: https://en.wikipedia.org/wiki/Planck%27s_law
+        - CIE Standard Illuminants: https://en.wikipedia.org/wiki/Standard_illuminant
+        - Color temperature: https://en.wikipedia.org/wiki/Color_temperature
+        - Implementation inspired by: https://github.com/TheZino/PlanckianJitter
+    """
+
+    class InitSchema(BaseTransformInitSchema):
+        mode: PlanckianJitterMode
+        temperature_limit: Annotated[tuple[int, int], AfterValidator(nondecreasing)] | None
+        sampling_method: Literal["uniform", "gaussian"]
+
+        @model_validator(mode="after")
+        def validate_temperature(self) -> Self:
+            max_temp = int(PLANKIAN_JITTER_CONST["MAX_TEMP"])
+
+            if self.temperature_limit is None:
+                if self.mode == "blackbody":
+                    self.temperature_limit = int(PLANKIAN_JITTER_CONST["MIN_BLACKBODY_TEMP"]), max_temp
+                elif self.mode == "cied":
+                    self.temperature_limit = int(PLANKIAN_JITTER_CONST["MIN_CIED_TEMP"]), max_temp
+            else:
+                if self.mode == "blackbody" and (
+                    min(self.temperature_limit) < PLANKIAN_JITTER_CONST["MIN_BLACKBODY_TEMP"]
+                    or max(self.temperature_limit) > max_temp
+                ):
+                    raise ValueError("Temperature limits for blackbody should be in [3000, 15000] range")
+                if self.mode == "cied" and (
+                    min(self.temperature_limit) < PLANKIAN_JITTER_CONST["MIN_CIED_TEMP"]
+                    or max(self.temperature_limit) > max_temp
+                ):
+                    raise ValueError("Temperature limits for CIED should be in [4000, 15000] range")
+
+                if not self.temperature_limit[0] <= PLANKIAN_JITTER_CONST["WHITE_TEMP"] <= self.temperature_limit[1]:
+                    raise ValueError("White temperature should be within the temperature limits")
+
+            return self
+
+    def __init__(
+        self,
+        mode: PlanckianJitterMode = "blackbody",
+        temperature_limit: tuple[int, int] | None = None,
+        sampling_method: Literal["uniform", "gaussian"] = "uniform",
+        always_apply: bool | None = None,
+        p: float = 0.5,
+    ) -> None:
+        super().__init__(p=p, always_apply=always_apply)
+
+        self.mode = mode
+        self.temperature_limit = cast(Tuple[int, int], temperature_limit)
+        self.sampling_method = sampling_method
+
+    def apply(self, img: np.ndarray, temperature: int, **params: Any) -> np.ndarray:
+        if not is_rgb_image(img):
+            raise TypeError("PlanckianJitter transformation expects 3-channel images.")
+        return fmain.planckian_jitter(img, temperature, mode=self.mode)
+
+    def get_params(self) -> dict[str, Any]:
+        sampling_prob_boundary = PLANKIAN_JITTER_CONST["SAMPLING_TEMP_PROB"]
+        sampling_temp_boundary = PLANKIAN_JITTER_CONST["WHITE_TEMP"]
+
+        if self.sampling_method == "uniform":
+            # Split into 2 cases to avoid selecting cold temperatures (>6000) too often
+            if random.random() < sampling_prob_boundary:
+                temperature = (
+                    random.uniform(
+                        self.temperature_limit[0],
+                        sampling_temp_boundary,
+                    ),
+                )
+            else:
+                temperature = (
+                    random.uniform(
+                        sampling_temp_boundary,
+                        self.temperature_limit[1],
+                    ),
+                )
+        elif self.sampling_method == "gaussian":
+            # Sample values from asymmetric gaussian distribution
+            if random.random() < sampling_prob_boundary:
+                # Left side
+                shift = np.abs(
+                    random.gauss(
+                        0,
+                        np.abs(sampling_temp_boundary - self.temperature_limit[0]) / 3,
+                    ),
+                )
+            else:
+                # Right side
+                shift = -np.abs(
+                    random.gauss(
+                        0,
+                        np.abs(self.temperature_limit[1] - sampling_temp_boundary) / 3,
+                    ),
+                )
+
+            temperature = sampling_temp_boundary - shift
+        else:
+            raise ValueError(f"Unknown sampling method: {self.sampling_method}")
+
+        return {"temperature": int(np.clip(temperature, self.temperature_limit[0], self.temperature_limit[1]))}
+
+    def get_transform_init_args_names(self) -> tuple[str, ...]:
+        return "mode", "temperature_limit", "sampling_method"
